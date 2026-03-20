@@ -110,7 +110,7 @@ ENV UV_PROJECT_ENVIRONMENT=/opt/nemo_rl_venv
 ENV UV_LINK_MODE=copy
 
 # Ensure DeepEP is built for H100 and B200 (also mcore inference unified memory API now invokes a torch API that requires these to be set)
-ENV TORCH_CUDA_ARCH_LIST="9.0 10.0"
+ENV TORCH_CUDA_ARCH_LIST="12.0"
 
 # First copy only the dependency files
 COPY --from=nemo-rl pyproject.toml uv.lock ./
@@ -141,9 +141,9 @@ uv sync --link-mode symlink --locked --no-install-project
 if [[ -z "${SKIP_VLLM_BUILD:-}" ]]; then
     uv sync --link-mode symlink --locked --extra vllm --no-install-project
 fi
-if [[ -z "${SKIP_SGLANG_BUILD:-}" ]]; then
-    uv sync --link-mode symlink --locked --extra sglang --no-install-project
-fi
+#if [[ -z "${SKIP_SGLANG_BUILD:-}" ]]; then
+#    uv sync --link-mode symlink --locked --extra sglang --no-install-project
+#fi
 uv sync --link-mode symlink --locked --extra mcore --no-install-project
 uv sync --link-mode symlink --locked --extra automodel --no-install-project
 uv sync --link-mode symlink --locked --all-groups --no-install-project
