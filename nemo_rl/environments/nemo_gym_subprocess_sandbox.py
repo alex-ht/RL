@@ -34,24 +34,39 @@ class SubprocessSandboxServer(SimpleResourcesServer):
     async def verify(self, body: SubprocessSandboxVerifyRequest) -> SubprocessSandboxVerifyResponse:
         result = self._execute_code(body.code)
 
-        if result["timed_out"]:
+        formatted_output = self._format_observation(result)
+
+        if result.get("timed_out"):
             return SubprocessSandboxVerifyResponse(
                 **body.model_dump(),
                 reward=0.0,
-                output="",
-                error="<timeout>",
+                output=formatted_output,
+                error=None,
                 timed_out=True,
             )
-
-        output = result.get("stdout", "") + result.get("stderr", "")
 
         return SubprocessSandboxVerifyResponse(
             **body.model_dump(),
             reward=1.0 if result["returncode"] == 0 else 0.0,
-            output=output[: self.config.max_output_lines * 100],
-            error=result.get("stderr"),
+            output=formatted_output,
+            error=result.get("stderr") or None,
             timed_out=False,
         )
+
+    def _format_observation(self, result: Dict[str, Any]) -> str:
+        if result.get("timed_out"):
+            return "<timeout>"
+
+        output = (result.get("stdout", "") + result.get("stderr", "")).strip()
+
+        if not output:
+            return "<empty output>"
+
+        lines = output.split("\n")
+        if len(lines) > self.config.max_output_lines:
+            lines = lines[: self.config.max_output_lines] + ["... (output truncated)"]
+
+        return "\n".join(lines)
 
     def _execute_code(self, code: str) -> Dict[str, Any]:
         result: Dict[str, Any] = {
