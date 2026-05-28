@@ -140,7 +140,7 @@ overrides = [
     { name = "torchaudio", marker = "sys_platform != 'darwin'", specifier = "==2.11.0", index = "https://download.pytorch.org/whl/cu130" },
     { name = "torchaudio", marker = "sys_platform == 'darwin'", specifier = "==2.11.0", index = "https://pypi.org/simple" },
     { name = "transformer-engine", extras = ["pytorch", "core-cu13"], git = "https://github.com/NVIDIA/TransformerEngine.git?rev=v2.14.1" },
-    { name = "transformers", specifier = "==5.3.0" },
+    { name = "transformers", specifier = "==5.5.0" },
     { name = "xgrammar", specifier = "==0.1.33" },
 ]
 
@@ -181,7 +181,7 @@ requires-dist = ["torch", "packaging", "ninja", "causal-conv1d"]
 [[manifest.dependency-metadata]]
 name = "megatron-bridge"
 version = "0.0.0"
-requires-dist = ["transformers>=5.0.0,<=5.3.0", "peft>=0.18.1", "datasets>=2.20.0", "accelerate", "diffusers>=0.36.0", "peft>=0.18.0", "einops", "imageio", "imageio-ffmpeg", "omegaconf>=2.3.0", "tensorboard>=2.19.0", "typing-extensions", "rich", "wandb>=0.25.0", "six>=1.17.0", "regex>=2024.11.6", "pyyaml>=6.0.2", "tqdm>=4.67.1", "hydra-core>1.3,<=1.3.2", "qwen-vl-utils", "transformer-engine[pytorch,core-cu13]", "mamba-ssm", "nvidia-resiliency-ext", "causal-conv1d", "flash-linear-attention", "timm", "open-clip-torch>=3.2.0", "mlflow>=3.9.0", "comet-ml>=3.50.0", "torch>=2.6.0"]
+requires-dist = ["transformers>=5.0.0,<=5.5.0", "peft>=0.18.1", "datasets>=2.20.0", "accelerate", "diffusers>=0.36.0", "peft>=0.18.0", "einops", "imageio", "imageio-ffmpeg", "omegaconf>=2.3.0", "tensorboard>=2.19.0", "typing-extensions", "rich", "wandb>=0.25.0", "six>=1.17.0", "regex>=2024.11.6", "pyyaml>=6.0.2", "tqdm>=4.67.1", "hydra-core>1.3,<=1.3.2", "qwen-vl-utils", "transformer-engine[pytorch,core-cu13]", "mamba-ssm", "nvidia-resiliency-ext", "causal-conv1d", "flash-linear-attention", "timm", "open-clip-torch>=3.2.0", "mlflow>=3.9.0", "comet-ml>=3.50.0", "torch>=2.6.0"]
 
 [[manifest.dependency-metadata]]
 name = "nv-grouped-gemm"
@@ -191,7 +191,7 @@ requires-dist = ["setuptools", "wheel", "torch", "numpy"]
 [[manifest.dependency-metadata]]
 name = "sglang"
 version = "0.5.10"
-requires-dist = ["ipython", "aiohttp", "apache-tvm-ffi>=0.1.5,<0.2", "anthropic>=0.20.0", "blobfile==3.0.0", "build", "compressed-tensors", "cuda-python==13.0", "decord2", "datasets", "einops", "fastapi", "flashinfer-python==0.6.7.post2", "flashinfer-cubin==0.6.7.post2", "gguf", "interegular", "llguidance>=0.7.11,<0.8.0", "modelscope", "msgspec", "ninja", "numpy", "nvidia-cutlass-dsl>=4.4.1", "nvidia-ml-py", "openai-harmony==0.0.4", "openai==2.6.1", "orjson", "outlines==0.1.11", "packaging", "partial-json-parser", "pillow", "prometheus-client>=0.20.0", "psutil", "py-spy", "pybase64", "pydantic", "python-multipart", "pyzmq>=25.1.2", "quack-kernels>=0.3.0", "requests", "scipy", "sentencepiece", "setproctitle", "flash-attn-4>=4.0.0b4", "sglang-kernel==0.4.1", "soundfile==0.13.1", "tiktoken", "timm==1.0.16", "torch-memory-saver==0.0.9", "torch==2.9.1", "torchao==0.9.0", "torchaudio==2.9.1", "torchcodec==0.9.1 ; (platform_machine != 'aarch64' and platform_machine != 'arm64' and platform_machine != 'armv7l') or sys_platform != 'linux'", "torchvision", "tqdm", "mistral-common>=1.9.0", "transformers==5.3.0", "uvicorn", "uvloop", "watchfiles", "xgrammar==0.1.32", "smg-grpc-servicer>=0.5.0"]
+requires-dist = ["ipython", "aiohttp", "apache-tvm-ffi>=0.1.5,<0.2", "anthropic>=0.20.0", "blobfile==3.0.0", "build", "compressed-tensors", "cuda-python==13.0", "decord2", "datasets", "einops", "fastapi", "flashinfer-python==0.6.7.post2", "flashinfer-cubin==0.6.7.post2", "gguf", "interegular", "llguidance>=0.7.11,<0.8.0", "modelscope", "msgspec", "ninja", "numpy", "nvidia-cutlass-dsl>=4.4.1", "nvidia-ml-py", "openai-harmony==0.0.4", "openai==2.6.1", "orjson", "outlines==0.1.11", "packaging", "partial-json-parser", "pillow", "prometheus-client>=0.20.0", "psutil", "py-spy", "pybase64", "pydantic", "python-multipart", "pyzmq>=25.1.2", "quack-kernels>=0.3.0", "requests", "scipy", "sentencepiece", "setproctitle", "flash-attn-4>=4.0.0b4", "sglang-kernel==0.4.1", "soundfile==0.13.1", "tiktoken", "timm==1.0.16", "torch-memory-saver==0.0.9", "torch==2.9.1", "torchao==0.9.0", "torchaudio==2.9.1", "torchcodec==0.9.1 ; (platform_machine != 'aarch64' and platform_machine != 'arm64' and platform_machine != 'armv7l') or sys_platform != 'linux'", "torchvision", "tqdm", "mistral-common>=1.9.0", "transformers==5.5.0", "uvicorn", "uvloop", "watchfiles", "xgrammar==0.1.32", "smg-grpc-servicer>=0.5.0"]
 
 [[manifest.dependency-metadata]]
 name = "sglang-kernel"
@@ -3075,7 +3075,7 @@ requires-dist = [
     { name = "torch", specifier = ">=2.6.0" },
     { name = "tqdm", specifier = ">=4.67.1" },
     { name = "transformer-engine", extras = ["pytorch", "core-cu13"] },
-    { name = "transformers", specifier = ">=5.0.0,<=5.3.0" },
+    { name = "transformers", specifier = ">=5.0.0,<=5.5.0" },
     { name = "typing-extensions" },
     { name = "wandb", specifier = ">=0.25.0" },
 ]
@@ -4049,7 +4049,7 @@ requires-dist = [
     { name = "transferqueue", git = "https://github.com/Ascend/TransferQueue.git?rev=b266d39" },
     { name = "transformer-engine", extras = ["core-cu13", "pytorch"], marker = "extra == 'automodel'", git = "https://github.com/NVIDIA/TransformerEngine.git?rev=v2.14.1" },
     { name = "transformer-engine", extras = ["core-cu13", "pytorch"], marker = "extra == 'mcore'", git = "https://github.com/NVIDIA/TransformerEngine.git?rev=v2.14.1" },
-    { name = "transformers", specifier = "==5.3.0" },
+    { name = "transformers", specifier = "==5.5.0" },
     { name = "transformers", marker = "extra == 'automodel'", specifier = ">=5.3.0" },
     { name = "triton", marker = "(platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine == 'x86_64' and sys_platform == 'linux')", index = "https://download.pytorch.org/whl/cu130" },
     { name = "vllm", marker = "platform_machine == 'aarch64' and sys_platform == 'linux' and extra == 'vllm'", url = "https://github.com/vllm-project/vllm/releases/download/v0.20.0/vllm-0.20.0-cp38-abi3-manylinux_2_35_aarch64.whl" },
@@ -7449,7 +7449,7 @@ dependencies = [
 
 [[package]]
 name = "transformers"
-version = "5.3.0"
+version = "5.5.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "huggingface-hub" },
@@ -7462,9 +7462,9 @@ dependencies = [
     { name = "tqdm" },
     { name = "typer" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/fc/1a/70e830d53ecc96ce69cfa8de38f163712d2b43ac52fbd743f39f56025c31/transformers-5.3.0.tar.gz", hash = "sha256:009555b364029da9e2946d41f1c5de9f15e6b1df46b189b7293f33a161b9c557", size = 8830831, upload-time = "2026-03-04T17:41:46.119Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/ff/9d/fb46e729b461985f41a5740167688b924a4019141e5c164bea77548d3d9e/transformers-5.5.0.tar.gz", hash = "sha256:c8db656cf51c600cd8c75f06b20ef85c72e8b8ff9abc880c5d3e8bc70e0ddcbd", size = 8237745, upload-time = "2026-04-02T16:13:08.113Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/b8/88/ae8320064e32679a5429a2c9ebbc05c2bf32cefb6e076f9b07f6d685a9b4/transformers-5.3.0-py3-none-any.whl", hash = "sha256:50ac8c89c3c7033444fb3f9f53138096b997ebb70d4b5e50a2e810bf12d3d29a", size = 10661827, upload-time = "2026-03-04T17:41:42.722Z" },
+    { url = "https://files.pythonhosted.org/packages/e7/28/35f7411ff80a3640c1f4fc907dcbb6a65061ebb82f66950e38bfc9f7f740/transformers-5.5.0-py3-none-any.whl", hash = "sha256:821a9ff0961abbb29eb1eb686d78df1c85929fdf213a3fe49dc6bd94f9efa944", size = 10245591, upload-time = "2026-04-02T16:13:03.462Z" },
 ]
 
 [[package]]
