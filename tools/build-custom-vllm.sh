@@ -1,5 +1,5 @@
 #!/bin/bash
-# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -21,19 +21,22 @@ REPO_ROOT="$(realpath "$SCRIPT_DIR/..")"
 
 # Parse command line arguments
 GIT_URL=${1:-https://github.com/vllm-project/vllm.git}
-GIT_REF=${2:-cc99baf14dacc2497d0c5ed84e076ef2c37f6a4d}
-# Specifying an explicit wheel URL avoids relying on vllm's nightly wheel discovery, which
-# fails when building from a fork (setup.py can't find the base commit on main) and falls back
-# to the "nightly" wheel — a moving target that may not have wheels for all architectures.
-# The v0.16.0 release wheels are pinned here for stability.
+GIT_REF=${2:-v0.20.0}
+# If a third argument (explicit precompiled wheel URL) is provided, export VLLM_PRECOMPILED_WHEEL_LOCATION
+# to instruct vLLM's build to download and use that wheel's prebuilt binaries instead of compiling
+# C++/CUDA extensions from the cloned source. This is the fast path and is the historical default
+# behavior when using published wheels for a commit (including the v0.20.0 release wheels).
+#
+# If the third argument is omitted/empty, do NOT set (or export) VLLM_PRECOMPILED_WHEEL_LOCATION.
+# The subsequent `uv pip install -e .` inside the vllm tree will perform a full from-source
+# compilation. Use this when your custom fork has C++/kernel changes, or no matching prebuilt
+# wheel is available for the GIT_REF.
 if [[ -n "${3:-}" ]]; then
   VLLM_PRECOMPILED_WHEEL_LOCATION="$3"
-elif [[ "$(uname -m)" == "aarch64" ]]; then
-  VLLM_PRECOMPILED_WHEEL_LOCATION="https://github.com/vllm-project/vllm/releases/download/v0.16.0/vllm-0.16.0-cp38-abi3-manylinux_2_31_aarch64.whl"
+  export VLLM_PRECOMPILED_WHEEL_LOCATION
 else
-  VLLM_PRECOMPILED_WHEEL_LOCATION="https://github.com/vllm-project/vllm/releases/download/v0.16.0/vllm-0.16.0-cp38-abi3-manylinux_2_31_x86_64.whl"
+  unset VLLM_PRECOMPILED_WHEEL_LOCATION || true
 fi
-export VLLM_PRECOMPILED_WHEEL_LOCATION
 
 BUILD_DIR=$(realpath "$SCRIPT_DIR/../3rdparty/vllm")
 if [[ -e "$BUILD_DIR" ]]; then
@@ -44,7 +47,11 @@ fi
 echo "Building vLLM from:"
 echo "  Vllm Git URL: $GIT_URL"
 echo "  Vllm Git ref: $GIT_REF"
-echo "  Vllm Wheel location: $VLLM_PRECOMPILED_WHEEL_LOCATION"
+if [[ -n "${VLLM_PRECOMPILED_WHEEL_LOCATION:-}" ]]; then
+  echo "  Vllm precompiled wheel: $VLLM_PRECOMPILED_WHEEL_LOCATION"
+else
+  echo "  Vllm precompiled wheel: <none - will compile from source>"
+fi
 
 # Clone the repository
 echo "Cloning repository..."
@@ -62,11 +69,15 @@ unset UV_PROJECT_ENVIRONMENT
 uv venv
 
 # Remove all comments from requirements files to prevent use_existing_torch.py from incorrectly removing xformers
+# (even though v0.20+ vllm reqs no longer list xformers, the comment stripping is still needed for any
+# torch mentions in comments that would cause the stripper to drop unrelated lines).
 echo "Removing comments from requirements files..."
 find requirements/ -name "*.txt" -type f -exec sed -i 's/#.*$//' {} \; 2>/dev/null || true
 find requirements/ -name "*.txt" -type f -exec sed -i '/^[[:space:]]*$/d' {} \; 2>/dev/null || true
-# Replace xformers==.* (but preserve any platform markers at the end)
-# NOTE: that xformers is bumped from 0.0.30 to 0.0.31 to work with torch==2.7.1. This version may need to change to change when we upgrade torch.
+# Replace xformers==.* (but preserve any platform markers at the end) — no-op on v0.20+ but kept for
+# forks based on older vllm trees that still declare xformers in requirements.
+# NOTE: xformers pin chosen for compatibility with torch 2.11 + cu13 (and TE / flash-attn used by NeMo-RL).
+# Update the version here if a newer xformers is required for your custom vllm fork + torch combo.
 find requirements/ -name "*.txt" -type f -exec sed -i -E 's/^(xformers)==[^;[:space:]]*/\1==0.0.32.post1/' {} \; 2>/dev/null || true
 
 uv run --no-project use_existing_torch.py
@@ -75,10 +86,18 @@ uv run --no-project use_existing_torch.py
 echo "Installing dependencies..."
 uv pip install --upgrade pip
 uv pip install numpy setuptools setuptools_scm
-uv pip install torch==2.10.0 --torch-backend=cu129
+# Use torch 2.11 + cu130 (CUDA 13) to match the rest of NeMo-RL (pyproject.toml, uv.lock, Docker base images
+# cuda-dl-base:...-cuda13, transformer-engine core_cu13, flash-attn cu13torch wheels, etc.).
+# Do NOT use cu129 / torch 2.10 here — that would produce a vllm built against CUDA 12 torch, causing
+# runtime mismatches (libcudart.so.12 vs cu13, symbol errors, etc.) in the final image / venv.
+uv pip install torch==2.11.0 --torch-backend=cu130
 
-# Install vLLM using precompiled wheel
-echo "Installing vLLM with precompiled wheel..."
+# Install vLLM: use precompiled wheel (fast, skips compilation) if provided; otherwise compile from the (custom) source.
+if [[ -n "${VLLM_PRECOMPILED_WHEEL_LOCATION:-}" ]]; then
+  echo "Installing vLLM using precompiled wheel (skips C++/CUDA compilation)..."
+else
+  echo "Installing vLLM by compiling from source (fresh build)..."
+fi
 uv pip install --no-build-isolation -e .
 
 echo "Build completed successfully!"
@@ -160,19 +179,44 @@ PY
 uv pip install setuptools_scm
 uv lock
 
-# Write to a file that a docker build will use to set the necessary env vars
-cat <<EOF >$BUILD_DIR/nemo-rl.env
+# Write to a file that a docker build will use to set the necessary env vars.
+# Only include VLLM_PRECOMPILED_WHEEL_LOCATION when a precompiled wheel was used (i.e. 3rd arg provided).
+cat >"$BUILD_DIR/nemo-rl.env" <<EOF
 export VLLM_GIT_REF=$GIT_REF
+EOF
+if [[ -n "${VLLM_PRECOMPILED_WHEEL_LOCATION:-}" ]]; then
+  cat >>"$BUILD_DIR/nemo-rl.env" <<EOF
 export VLLM_PRECOMPILED_WHEEL_LOCATION=$VLLM_PRECOMPILED_WHEEL_LOCATION
 EOF
+fi
 
 cat <<EOF
 [INFO] pyproject.toml updated. NeMo RL is now configured to use the local vLLM at 3rdparty/vllm.
 [INFO] Verify this new vllm version by running:
+EOF
 
+if [[ -n "${VLLM_PRECOMPILED_WHEEL_LOCATION:-}" ]]; then
+  cat <<EOF
 VLLM_PRECOMPILED_WHEEL_LOCATION=$VLLM_PRECOMPILED_WHEEL_LOCATION \\
   uv run --extra vllm vllm serve Qwen/Qwen3-0.6B
+EOF
+else
+  cat <<'EOF'
+# (no VLLM_PRECOMPILED_WHEEL_LOCATION set — this custom vLLM will compile from the local 3rdparty/vllm source)
+uv run --extra vllm vllm serve Qwen/Qwen3-0.6B
+EOF
+fi
 
+cat <<EOF
 [INFO] For more information on this custom install, visit https://github.com/NVIDIA-NeMo/RL/blob/main/docs/guides/use-custom-vllm.md
+EOF
+
+if [[ -n "${VLLM_PRECOMPILED_WHEEL_LOCATION:-}" ]]; then
+  cat <<EOF
 [IMPORTANT] Remember to set the shell variable 'VLLM_PRECOMPILED_WHEEL_LOCATION' when running NeMo RL apps with this custom vLLM to avoid re-compiling.
 EOF
+else
+  cat <<EOF
+[IMPORTANT] This vLLM was built from source with no precompiled wheel. Ray worker venvs and rebuilds (NRL_FORCE_REBUILD_VENVS) will compile C++/CUDA kernels from 3rdparty/vllm at install time. This is slower than the precompiled-wheel path; pass a wheel URL as the 3rd arg to build-custom-vllm.sh if a matching prebuilt is available.
+EOF
+fi

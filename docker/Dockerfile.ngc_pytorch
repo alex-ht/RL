@@ -1,3 +1,4 @@
+# syntax=docker/dockerfile:1.7-labs
 # This Dockerfile is used to build a Docker image for NeMo RL with the NGC PyTorch base image.
 # However, it is still a work in progress and is not yet ready for production use.
 #

@@ -499,6 +499,7 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
                 "chat_template_content_format"
             ],
             enable_auto_tools=serving_chat_kwargs["enable_auto_tools"],
+            io_processor=engine_client.io_processor,
         )
         serving_chat_kwargs.update(
             dict(

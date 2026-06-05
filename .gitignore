@@ -35,10 +35,9 @@ hf_home/
 hf_datasets_cache/
 *logs/
 /datasets/
-docker/*
-!docker/Dockerfile
-!docker/Dockerfile.ngc_pytorch
-!docker/README.md
+docker/Dockerfile.bak-*
+docker/Dockerfile.phase1-backup-*
+docker/Dockerfile.unified-jhub*
 wandb/
 checkpoints/
 results/
