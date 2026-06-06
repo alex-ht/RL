@@ -55,6 +55,7 @@ apt-get install -y --no-install-recommends \
     wget \
     less \
     vim \
+    libz3-4
 
 # Nsight
 apt install -y --no-install-recommends gnupg
@@ -67,6 +68,10 @@ apt install -y nsight-systems-cli
 apt install -y --only-upgrade gnupg
 
 apt-get clean
+cp /usr/lib/x86_64-linux-gnu/libz3.so.4 /usr/lib/x86_64-linux-gnu/libz3.so.4.15
+rm /usr/lib/x86_64-linux-gnu/libz3.so.4
+ln -s /usr/lib/x86_64-linux-gnu/libz3.so.4.15 /usr/lib/x86_64-linux-gnu/libz3.so.4
+ldconfig
 rm -rf /var/lib/apt/lists/*
 EOF
 
