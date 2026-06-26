@@ -779,7 +779,18 @@ def _apply_performance_config(model_cfg: Any, config: PolicyConfig) -> None:
         )
 
     # Fusion settings
-    model_cfg.apply_rope_fusion = config["megatron_cfg"]["apply_rope_fusion"]
+    apply_rope_fusion = config["megatron_cfg"]["apply_rope_fusion"]
+
+    # Disable fused RoPE for VLM models with sequence packing + context parallel
+    # due to cu_seqlens not being updated in slice_batch_for_context_parallel for THD format
+    is_vlm = config["policy"].get("model_name", "").endswith(("-vl", "-VL"))
+    use_seq_packing = config["policy"].get("sequence_packing", {}).get("enabled", False)
+    use_cp = config["policy"].get("megatron_cfg", {}).get("context_parallel_size", 1) > 1
+
+    if is_vlm and use_seq_packing and use_cp and apply_rope_fusion:
+        apply_rope_fusion = False
+
+    model_cfg.apply_rope_fusion = apply_rope_fusion
     model_cfg.bias_activation_fusion = config["megatron_cfg"]["bias_activation_fusion"]
     model_cfg.gradient_accumulation_fusion = config["megatron_cfg"][
         "gradient_accumulation_fusion"
