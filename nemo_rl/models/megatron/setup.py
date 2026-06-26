@@ -783,9 +783,14 @@ def _apply_performance_config(model_cfg: Any, config: PolicyConfig) -> None:
 
     # Disable fused RoPE for VLM models with sequence packing + context parallel
     # due to cu_seqlens not being updated in slice_batch_for_context_parallel for THD format
-    is_vlm = config["policy"].get("model_name", "").endswith(("-vl", "-VL"))
-    use_seq_packing = config["policy"].get("sequence_packing", {}).get("enabled", False)
-    use_cp = config["policy"].get("megatron_cfg", {}).get("context_parallel_size", 1) > 1
+    model_name = config.get("model_name", "")
+    is_vlm = model_name.endswith(("-vl", "-VL")) or model_name.endswith(("-vl-it", "-VL-it"))
+
+    seq_packing_cfg = config.get("sequence_packing")
+    use_seq_packing = seq_packing_cfg is not None and seq_packing_cfg.get("enabled", False) if seq_packing_cfg else False
+
+    megatron_cfg = config.get("megatron_cfg")
+    use_cp = megatron_cfg.get("context_parallel_size", 1) > 1 if megatron_cfg else False
 
     if is_vlm and use_seq_packing and use_cp and apply_rope_fusion:
         apply_rope_fusion = False
