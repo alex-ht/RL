@@ -783,8 +783,13 @@ def _apply_performance_config(model_cfg: Any, config: PolicyConfig) -> None:
 
     # Disable fused RoPE for VLM models with sequence packing + context parallel
     # due to cu_seqlens not being updated in slice_batch_for_context_parallel for THD format
-    model_name = config.get("model_name", "")
-    is_vlm = model_name.endswith(("-vl", "-VL")) or model_name.endswith(("-vl-it", "-VL-it"))
+    model_name = config.get("model_name", "").lower()
+    # Detect VLM models: Gemma-4, Qwen3-VL, etc.
+    is_vlm = any(vlm_pattern in model_name for vlm_pattern in [
+        "gemma-4", "gemma4",  # All Gemma-4 are VLM
+        "qwen3-vl", "qwen3vl", "qwen-vl", "qwenvl",  # Qwen VL models
+        "-vl-", "-vl-it",  # Generic VL suffix
+    ])
 
     seq_packing_cfg = config.get("sequence_packing")
     use_seq_packing = seq_packing_cfg is not None and seq_packing_cfg.get("enabled", False) if seq_packing_cfg else False
@@ -793,6 +798,10 @@ def _apply_performance_config(model_cfg: Any, config: PolicyConfig) -> None:
     use_cp = megatron_cfg.get("context_parallel_size", 1) > 1 if megatron_cfg else False
 
     if is_vlm and use_seq_packing and use_cp and apply_rope_fusion:
+        warnings.warn(
+            f"Disabling fused RoPE for VLM + sequence packing + CP combo "
+            f"(model={config.get('model_name')})"
+        )
         apply_rope_fusion = False
 
     model_cfg.apply_rope_fusion = apply_rope_fusion
