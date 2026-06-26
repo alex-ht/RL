@@ -261,6 +261,23 @@ class DTensorPolicyWorkerImpl(
 
         hf_config_overrides = self.cfg.get("hf_config_overrides", {}) or {}
 
+        # Ensure custom architectures (e.g. gemma4) are registered in this worker venv.
+        # Mirrors the logic in automodel/setup.py:_ensure_custom_model_registrations.
+        try:
+            from nemo_rl.models.automodel.setup import ensure_custom_model_registrations
+
+            ensure_custom_model_registrations(model_name)
+        except Exception:
+            pass
+
+        # Also ensure HF modules PYTHONPATH in this process.
+        try:
+            from nemo_rl import patch_transformers_module_dir
+
+            patch_transformers_module_dir(os.environ)
+        except Exception:
+            pass
+
         model_config = AutoConfig.from_pretrained(
             model_name,
             # Always load the model in float32 to keep master weights in float32.

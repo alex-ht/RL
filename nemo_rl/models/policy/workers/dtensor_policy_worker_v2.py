@@ -231,6 +231,23 @@ class DTensorPolicyWorkerV2Impl(
         # Apply TE patch until TE is upgraded to 2.10.0
         apply_transformer_engine_patch()
 
+        # Patch HF modules dir early for trust_remote_code custom code (gemma4 etc.)
+        # to be importable inside this isolated worker venv.
+        try:
+            from nemo_rl import patch_transformers_module_dir
+
+            patch_transformers_module_dir(os.environ)
+        except Exception:
+            pass
+
+        # Ensure registrations early (tokenizer load may indirectly need, validate will too).
+        try:
+            from nemo_rl.models.automodel.setup import ensure_custom_model_registrations
+
+            ensure_custom_model_registrations(config.get("model_name", ""))
+        except Exception:
+            pass
+
         # Store configuration
         self.cfg = config
 

@@ -277,7 +277,8 @@ _patch_nsight_file()
 # Need to set PYTHONPATH to include transformers downloaded modules.
 # Assuming the cache directory is the same cross venvs.
 def patch_transformers_module_dir(env_vars: dict[str, str]):
-    hf_home = os.environ.get("HF_HOME", None)
+    # Prefer HF_HOME from the provided env_vars (for workers), fall back to os.environ.
+    hf_home = env_vars.get("HF_HOME") or os.environ.get("HF_HOME")
     if hf_home is None:
         return env_vars
 

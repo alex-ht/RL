@@ -88,6 +88,7 @@ from nemo_rl.models.megatron.router_replay import (
     router_replay_enabled,
     validate_router_replay_config,
 )
+from nemo_rl.models.automodel.setup import STRING_TO_DTYPE
 from nemo_rl.models.policy import PolicyConfig
 from nemo_rl.models.policy.utils import (
     configure_dynamo_cache,
@@ -1192,6 +1193,11 @@ def setup_model_and_optimizer(
             raise ValueError(
                 "If megtatron_cfg.peft.enabled is True, alpha must be set in peft_cfg"
             )
+        _lora_dtype_raw = peft_cfg["lora_dtype"]
+        if isinstance(_lora_dtype_raw, str) and _lora_dtype_raw.lower() != "none":
+            _lora_dtype = STRING_TO_DTYPE[_lora_dtype_raw]
+        else:
+            _lora_dtype = None if isinstance(_lora_dtype_raw, str) else _lora_dtype_raw
         peft = LoRA(
             target_modules=peft_cfg["target_modules"],
             exclude_modules=peft_cfg["exclude_modules"],
@@ -1202,7 +1208,7 @@ def setup_model_and_optimizer(
             lora_A_init_method=peft_cfg["lora_A_init_method"],
             lora_B_init_method=peft_cfg["lora_B_init_method"],
             a2a_experimental=peft_cfg["a2a_experimental"],
-            lora_dtype=peft_cfg["lora_dtype"],
+            lora_dtype=_lora_dtype,
         )
     else:
         peft = None
@@ -1443,6 +1449,11 @@ def setup_reference_model_state(
             raise ValueError(
                 "If megtatron_cfg.peft.enabled is True, alpha must be set in peft_cfg"
             )
+        _lora_dtype_raw = peft_cfg["lora_dtype"]
+        if isinstance(_lora_dtype_raw, str) and _lora_dtype_raw.lower() != "none":
+            _lora_dtype = STRING_TO_DTYPE[_lora_dtype_raw]
+        else:
+            _lora_dtype = None if isinstance(_lora_dtype_raw, str) else _lora_dtype_raw
         peft = LoRA(
             target_modules=peft_cfg["target_modules"],
             exclude_modules=peft_cfg["exclude_modules"],
@@ -1453,7 +1464,7 @@ def setup_reference_model_state(
             lora_A_init_method="zero",
             lora_B_init_method="zero",
             a2a_experimental=peft_cfg["a2a_experimental"],
-            lora_dtype=peft_cfg["lora_dtype"],
+            lora_dtype=_lora_dtype,
         )
     else:
         peft = None

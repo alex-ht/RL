@@ -56,6 +56,47 @@ STRING_TO_DTYPE = {
 }
 
 
+def ensure_custom_model_registrations(model_name: str) -> None:
+    """Best-effort import of architecture support modules in the *current* interpreter.
+
+    Ray policy workers (DTensorPolicyWorkerV2 etc) run in isolated venvs via
+    per-actor py_executable. Registration side-effects that make model_type
+    (e.g. "gemma4") known to transformers' AutoConfig / CONFIG_MAPPING only
+    become visible if the supporting modules are imported *inside that venv's
+    python*.
+
+    We trigger imports of known custom-model shims (from nemo-automodel) which
+    in turn import the corresponding transformers.models.* code and/or execute
+    registrations. This is the extension point for future models.
+
+    Called from validate_and_prepare_config (and v1 worker) before any
+    AutoConfig.from_pretrained.
+    """
+    if not model_name:
+        return
+    name_lower = model_name.lower()
+
+    # Map substrings in model_name/repo_id to modules that must be imported
+    # for their model_type to be recognized by AutoConfig.
+    # Extend this dict when adding support for new models that exhibit
+    # "Transformers does not recognize this architecture" only in workers.
+    arch_to_modules: dict[str, list[str]] = {
+        "gemma4": ["nemo_automodel.components.models.gemma4_moe.model"],
+        # Example for future:
+        # "newfoo": ["nemo_automodel.components.models.newfoo.model"],
+    }
+
+    for key, modules in arch_to_modules.items():
+        if key in name_lower:
+            for mod_path in modules:
+                try:
+                    importlib.import_module(mod_path)
+                except Exception:
+                    # Best effort only; real failure will surface from from_pretrained
+                    # with more diagnostics.
+                    pass
+
+
 def _maybe_set_force_hf(automodel_kwargs: dict, model_config) -> None:
     """Validate and maybe auto-set force_hf based on adapter compatibility.
 
@@ -156,6 +197,9 @@ def get_tokenizer(
     Returns:
         The configured tokenizer or processor instance.
     """
+    # Ensure registrations for custom model_types (e.g. gemma4) so that tokenizer
+    # or processor loading with trust_remote_code can resolve architecture.
+    ensure_custom_model_registrations(tokenizer_config.get("name", ""))
     processor = None
 
     if get_processor:
@@ -257,6 +301,16 @@ def validate_and_prepare_config(
     # with different order of node_bundles
     configure_dynamo_cache()
 
+    # Ensure HF modules dir (populated by trust_remote_code downloads) is on PYTHONPATH
+    # inside the worker. The top-level patch at `import nemo_rl` time may precede
+    # downloads or not fully propagate into isolated Ray venvs.
+    try:
+        from nemo_rl import patch_transformers_module_dir
+
+        patch_transformers_module_dir(os.environ)
+    except Exception:
+        pass
+
     # Parse precision
     precision = config["precision"]
     if precision not in STRING_TO_DTYPE:
@@ -298,6 +352,11 @@ def validate_and_prepare_config(
         if (enable_seq_packing and cp_size_cfg == 1)
         else ("sdpa" if cp_size_cfg > 1 else None)
     )
+
+    # Ensure architecture-specific registrations are visible in *this* interpreter/venv.
+    # Must precede AutoConfig.from_pretrained for models like gemma4 whose model_type
+    # registration is not eager in all supported transformers pins.
+    ensure_custom_model_registrations(model_name)
 
     # Load model config
     model_config = AutoConfig.from_pretrained(
