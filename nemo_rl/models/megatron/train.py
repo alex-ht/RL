@@ -131,6 +131,10 @@ def model_forward(
             **multimodal_data,
         )
 
+    # Handle tuple return: (output_tensor, loss_mask) from VLM models with CP
+    if isinstance(output_tensor, tuple):
+        output_tensor = output_tensor[0]
+
     return output_tensor
 
 

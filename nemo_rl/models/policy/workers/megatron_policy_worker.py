@@ -118,20 +118,21 @@ def _should_use_router_replay(
 
 
 def _model_self_packs_for_cp(model: Any) -> bool:
-    """Whether the model packs sequences + CP-shards inside its own forward.
+    """Whether the model handles its own CP sharding inside its own forward.
 
-    Such models (mbridge VLM wrappers) call ``preprocess_packed_seqs`` in their
-    forward, so NeMo-RL must hand them an unpacked ``[B, S]`` batch instead of
-    pre-packing + CP-sharding itself. The only such model today is mbridge's
-    Qwen3VL, which is also the only mbridge VLM that supports context
-    parallelism; classic mcore GPTModel and other VLMs do not self-pack.
+    These mbridge VLM wrappers expect an unpacked [B, S] batch from NeMo-RL
+    (not pre-packed + CP-sharded) and perform CP sharding themselves post-embedding.
+    - Qwen3VLModel: calls ``preprocess_packed_seqs`` to pack + CP-shard
+    - Gemma4VLModel: calls ``slice_batch_for_context_parallel`` post-embedding
+    Classic mcore GPTModel and other non-VLM models do not self-shard.
     """
+    from megatron.bridge.models.gemma_vl.modeling_gemma4_vl import Gemma4VLModel
     from megatron.bridge.models.qwen_vl.modelling_qwen3_vl.model import Qwen3VLModel
     from megatron.core.utils import unwrap_model
 
     unwrapped = unwrap_model(model)
     chunks = unwrapped if isinstance(unwrapped, (list, tuple)) else [unwrapped]
-    return any(isinstance(chunk, Qwen3VLModel) for chunk in chunks)
+    return any(isinstance(chunk, (Qwen3VLModel, Gemma4VLModel)) for chunk in chunks)
 
 
 # Classes with @ray.remote can't be inherited from, so we split the implementation out.
