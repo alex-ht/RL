@@ -88,7 +88,6 @@ from nemo_rl.models.megatron.router_replay import (
     router_replay_enabled,
     validate_router_replay_config,
 )
-from nemo_rl.models.automodel.setup import STRING_TO_DTYPE
 from nemo_rl.models.policy import PolicyConfig
 from nemo_rl.models.policy.utils import (
     configure_dynamo_cache,
@@ -97,6 +96,12 @@ from nemo_rl.models.policy.utils import (
 from nemo_rl.models.value.config import ValueConfig
 
 TokenizerType = TypeVar("TokenizerType", bound=PreTrainedTokenizerBase)
+
+_LORA_DTYPE_MAP: dict[str, torch.dtype] = {
+    "float32": torch.float32,
+    "bfloat16": torch.bfloat16,
+    "float16": torch.float16,
+}
 
 
 def destroy_parallel_state():
@@ -1195,7 +1200,7 @@ def setup_model_and_optimizer(
             )
         _lora_dtype_raw = peft_cfg["lora_dtype"]
         if isinstance(_lora_dtype_raw, str) and _lora_dtype_raw.lower() != "none":
-            _lora_dtype = STRING_TO_DTYPE[_lora_dtype_raw]
+            _lora_dtype = _LORA_DTYPE_MAP[_lora_dtype_raw]
         else:
             _lora_dtype = None if isinstance(_lora_dtype_raw, str) else _lora_dtype_raw
         peft = LoRA(
@@ -1451,7 +1456,7 @@ def setup_reference_model_state(
             )
         _lora_dtype_raw = peft_cfg["lora_dtype"]
         if isinstance(_lora_dtype_raw, str) and _lora_dtype_raw.lower() != "none":
-            _lora_dtype = STRING_TO_DTYPE[_lora_dtype_raw]
+            _lora_dtype = _LORA_DTYPE_MAP[_lora_dtype_raw]
         else:
             _lora_dtype = None if isinstance(_lora_dtype_raw, str) else _lora_dtype_raw
         peft = LoRA(
