@@ -797,10 +797,12 @@ def _apply_performance_config(model_cfg: Any, config: PolicyConfig) -> None:
     megatron_cfg = config.get("megatron_cfg")
     use_cp = megatron_cfg.get("context_parallel_size", 1) > 1 if megatron_cfg else False
 
-    if is_vlm and use_seq_packing and use_cp and apply_rope_fusion:
+    # Always disable fused RoPE when sequence packing + context parallel is enabled
+    # (works for both VLM and non-VLM models, as this combo is generally problematic)
+    if (use_seq_packing and use_cp and apply_rope_fusion):
         warnings.warn(
-            f"Disabling fused RoPE for VLM + sequence packing + CP combo "
-            f"(model={config.get('model_name')})"
+            f"Disabling fused RoPE due to sequence packing + context parallel combo "
+            f"(model={config.get('model_name')}, is_vlm={is_vlm})"
         )
         apply_rope_fusion = False
 
