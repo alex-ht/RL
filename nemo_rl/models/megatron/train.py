@@ -109,6 +109,19 @@ def model_forward(
     # Mamba models currently do not support packed_seq_params
     if packed_seq_params is not None:
         additional_kwargs["packed_seq_params"] = packed_seq_params
+        # Fused RoPE THD path (apply_rope_fusion=True + cu_seqlens) fails for VLMs with
+        # context parallelism because slice_batch_for_context_parallel does not update
+        # cu_seqlens (intentional for ring attention). Disable it directly on the shared
+        # TransformerConfig that all attention layers reference.
+        from megatron.core.parallel_state import get_context_parallel_world_size
+        from megatron.core.utils import get_model_config as _get_mc
+        try:
+            if get_context_parallel_world_size() > 1:
+                mc = _get_mc(model)
+                if getattr(mc, "apply_rope_fusion", False):
+                    mc.apply_rope_fusion = False
+        except Exception:
+            pass
 
     # Pass MTP loss mask to exclude prompt tokens from MTP loss
     if mtp_loss_mask is not None:
