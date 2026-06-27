@@ -118,9 +118,19 @@ def model_forward(
         additional_kwargs["fp32_output"] = False
     if use_linear_ce_fusion_loss:
         additional_kwargs["labels"] = input_ids_cp_sharded
-        # Only pass this kwarg when linear CE fusion is enabled. Older Megatron-LM
-        # GPTModel.forward signatures do not accept it.
-        additional_kwargs["return_logprobs_for_linear_ce_fusion"] = True
+        # Only pass this kwarg for standard GPTModel (not VLM models which have their own signature)
+        # Check if this is a VLM model wrapper by checking for the language_model attribute
+        from megatron.bridge.models.gemma_vl.modeling_gemma4_vl import Gemma4VLModel
+        from megatron.bridge.models.qwen_vl.modelling_qwen3_vl.model import Qwen3VLModel
+        from megatron.core.utils import unwrap_model
+
+        unwrapped = unwrap_model(model)
+        is_vlm_wrapper = isinstance(unwrapped, (Gemma4VLModel, Qwen3VLModel))
+
+        if not is_vlm_wrapper:
+            # Only pass this kwarg when linear CE fusion is enabled. Older Megatron-LM
+            # GPTModel.forward signatures do not accept it.
+            additional_kwargs["return_logprobs_for_linear_ce_fusion"] = True
 
     with straggler_timer() if straggler_timer is not None else nullcontext():
         output_tensor = model(
