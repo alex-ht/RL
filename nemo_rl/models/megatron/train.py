@@ -70,6 +70,47 @@ PostProcessingFunction = Union[
 ]
 
 
+_rope_utils_cp_patched = False
+
+
+def _ensure_rope_utils_cp_packing_patch() -> None:
+    """One-time monkey-patch on apply_rotary_pos_emb for CP + seq-packing.
+
+    After slice_batch_for_context_parallel, the token dimension of query/key is
+    T_local = T_total / cp_size, but packed_seq_params.cu_seqlens still sums to
+    T_total (intentional for ring attention).  The fused THD RoPE kernel requires
+    cu_seqlens[-1] == t.shape[0]; passing a larger cu_seqlens triggers the
+    "expected 3D tensor" CUDA error.  This patch detects the mismatch and
+    forces apply_rope_fusion=False on the config object so the unfused path is
+    taken instead.
+    """
+    global _rope_utils_cp_patched
+    if _rope_utils_cp_patched:
+        return
+    try:
+        import megatron.core.models.common.embeddings.rope_utils as _rope_mod
+
+        _orig = _rope_mod.apply_rotary_pos_emb
+
+        def _patched_apply_rotary_pos_emb(t, freqs, config, cu_seqlens=None, **kwargs):
+            if (
+                cu_seqlens is not None
+                and getattr(config, "apply_rope_fusion", False)
+                and cu_seqlens.numel() > 0
+                and t.shape[0] < cu_seqlens[-1].item()
+            ):
+                # CP has sliced the sequence: t has fewer tokens than cu_seqlens
+                # represents.  Disable fused THD RoPE for this config object so
+                # all subsequent calls also take the unfused path.
+                config.apply_rope_fusion = False
+            return _orig(t, freqs, config, cu_seqlens=cu_seqlens, **kwargs)
+
+        _rope_mod.apply_rotary_pos_emb = _patched_apply_rotary_pos_emb
+    except Exception:
+        pass
+    _rope_utils_cp_patched = True
+
+
 def model_forward(
     model: GPTModel,
     data_dict: BatchedDataDict[Any],
@@ -109,24 +150,7 @@ def model_forward(
     # Mamba models currently do not support packed_seq_params
     if packed_seq_params is not None:
         additional_kwargs["packed_seq_params"] = packed_seq_params
-        # Fused RoPE THD path (apply_rope_fusion=True + cu_seqlens) fails for VLMs with
-        # context parallelism because slice_batch_for_context_parallel does not update
-        # cu_seqlens (intentional for ring attention). Disable it on the TransformerConfig
-        # that attention layers actually reference: for VLMs this lives on language_model,
-        # not on the outer wrapper, so we walk the chain explicitly.
-        from megatron.core.parallel_state import get_context_parallel_world_size
-        from megatron.core.utils import unwrap_model
-        try:
-            if get_context_parallel_world_size() > 1:
-                inner = unwrap_model(model)
-                if isinstance(inner, (list, tuple)):
-                    inner = inner[0]
-                lm = getattr(inner, "language_model", None)
-                cfg_to_patch = getattr(lm, "config", None) if lm is not None else getattr(inner, "config", None)
-                if cfg_to_patch is not None and getattr(cfg_to_patch, "apply_rope_fusion", False):
-                    cfg_to_patch.apply_rope_fusion = False
-        except Exception:
-            pass
+        _ensure_rope_utils_cp_packing_patch()
 
     # Pass MTP loss mask to exclude prompt tokens from MTP loss
     if mtp_loss_mask is not None:
