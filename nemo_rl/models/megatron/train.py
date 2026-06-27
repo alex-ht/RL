@@ -70,54 +70,6 @@ PostProcessingFunction = Union[
 ]
 
 
-_rope_utils_cp_patched = False
-
-
-def _ensure_rope_utils_cp_packing_patch() -> None:
-    """One-time monkey-patch on apply_rotary_pos_emb for CP + seq-packing.
-
-    After slice_batch_for_context_parallel, the token dimension of query/key is
-    T_local = T_total / cp_size, but packed_seq_params.cu_seqlens still sums to
-    T_total (intentional for ring attention).  The fused THD RoPE kernel requires
-    cu_seqlens[-1] == t.shape[0]; passing a larger cu_seqlens triggers the
-    "expected 3D tensor" CUDA error.  This patch detects the mismatch and
-    forces apply_rope_fusion=False on the config object so the unfused path is
-    taken instead.
-
-    attention.py imports apply_rotary_pos_emb via ``from rope_utils import ...``
-    (a local binding), so we must patch the name on the attention module itself,
-    not on rope_utils.
-    """
-    global _rope_utils_cp_patched
-    if _rope_utils_cp_patched:
-        return
-    try:
-        import megatron.core.models.common.embeddings.rope_utils as _rope_mod
-        import megatron.core.transformer.attention as _attn_mod
-
-        _orig = _rope_mod.apply_rotary_pos_emb
-
-        def _patched_apply_rotary_pos_emb(t, freqs, config, cu_seqlens=None, **kwargs):
-            if (
-                cu_seqlens is not None
-                and getattr(config, "apply_rope_fusion", False)
-                and cu_seqlens.numel() > 0
-                and t.shape[0] < cu_seqlens[-1].item()
-            ):
-                # CP has sliced the sequence: t has fewer tokens than cu_seqlens
-                # represents.  Disable fused THD RoPE for this config object so
-                # all subsequent calls also take the unfused path.
-                config.apply_rope_fusion = False
-            return _orig(t, freqs, config, cu_seqlens=cu_seqlens, **kwargs)
-
-        # Patch both the source module and the already-imported binding in attention.py.
-        _rope_mod.apply_rotary_pos_emb = _patched_apply_rotary_pos_emb
-        _attn_mod.apply_rotary_pos_emb = _patched_apply_rotary_pos_emb
-    except Exception:
-        pass
-    _rope_utils_cp_patched = True
-
-
 def model_forward(
     model: GPTModel,
     data_dict: BatchedDataDict[Any],
@@ -157,7 +109,6 @@ def model_forward(
     # Mamba models currently do not support packed_seq_params
     if packed_seq_params is not None:
         additional_kwargs["packed_seq_params"] = packed_seq_params
-        _ensure_rope_utils_cp_packing_patch()
 
     # Pass MTP loss mask to exclude prompt tokens from MTP loss
     if mtp_loss_mask is not None:
