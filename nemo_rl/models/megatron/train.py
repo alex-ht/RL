@@ -111,15 +111,20 @@ def model_forward(
         additional_kwargs["packed_seq_params"] = packed_seq_params
         # Fused RoPE THD path (apply_rope_fusion=True + cu_seqlens) fails for VLMs with
         # context parallelism because slice_batch_for_context_parallel does not update
-        # cu_seqlens (intentional for ring attention). Disable it directly on the shared
-        # TransformerConfig that all attention layers reference.
+        # cu_seqlens (intentional for ring attention). Disable it on the TransformerConfig
+        # that attention layers actually reference: for VLMs this lives on language_model,
+        # not on the outer wrapper, so we walk the chain explicitly.
         from megatron.core.parallel_state import get_context_parallel_world_size
-        from megatron.core.utils import get_model_config as _get_mc
+        from megatron.core.utils import unwrap_model
         try:
             if get_context_parallel_world_size() > 1:
-                mc = _get_mc(model)
-                if getattr(mc, "apply_rope_fusion", False):
-                    mc.apply_rope_fusion = False
+                inner = unwrap_model(model)
+                if isinstance(inner, (list, tuple)):
+                    inner = inner[0]
+                lm = getattr(inner, "language_model", None)
+                cfg_to_patch = getattr(lm, "config", None) if lm is not None else getattr(inner, "config", None)
+                if cfg_to_patch is not None and getattr(cfg_to_patch, "apply_rope_fusion", False):
+                    cfg_to_patch.apply_rope_fusion = False
         except Exception:
             pass
 
