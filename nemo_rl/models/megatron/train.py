@@ -83,12 +83,17 @@ def _ensure_rope_utils_cp_packing_patch() -> None:
     "expected 3D tensor" CUDA error.  This patch detects the mismatch and
     forces apply_rope_fusion=False on the config object so the unfused path is
     taken instead.
+
+    attention.py imports apply_rotary_pos_emb via ``from rope_utils import ...``
+    (a local binding), so we must patch the name on the attention module itself,
+    not on rope_utils.
     """
     global _rope_utils_cp_patched
     if _rope_utils_cp_patched:
         return
     try:
         import megatron.core.models.common.embeddings.rope_utils as _rope_mod
+        import megatron.core.transformer.attention as _attn_mod
 
         _orig = _rope_mod.apply_rotary_pos_emb
 
@@ -105,7 +110,9 @@ def _ensure_rope_utils_cp_packing_patch() -> None:
                 config.apply_rope_fusion = False
             return _orig(t, freqs, config, cu_seqlens=cu_seqlens, **kwargs)
 
+        # Patch both the source module and the already-imported binding in attention.py.
         _rope_mod.apply_rotary_pos_emb = _patched_apply_rotary_pos_emb
+        _attn_mod.apply_rotary_pos_emb = _patched_apply_rotary_pos_emb
     except Exception:
         pass
     _rope_utils_cp_patched = True
