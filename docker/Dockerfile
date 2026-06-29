@@ -192,16 +192,17 @@ find /root/.cache/uv -type d -path "*ray/_private/runtime_env/agent/thirdparty_f
 echo "${CACHE_KEY}" > /root/.cache/uv/.cache-key
 EOF
 
-# Install Flash Attention v3 from source (Hopper sm_90/H100, Blackwell sm_100/B200).
-# Overrides the FA2 wheel installed by uv sync above; build takes ~30-60 min.
-# Override the ref via: --build-arg FLASH_ATTN_V3_REF=<tag-or-branch>
-ARG FLASH_ATTN_V3_REF=v3.0.0
+# Install Flash Attention v3 (beta) from the hopper/ subdirectory.
+# FA3 lives in hopper/ and imports as flash_attn_interface (separate from flash_attn).
+# Requires CUDA >= 12.3; this image has CUDA 13.2 which is supported.
+# Override the ref via: --build-arg FLASH_ATTN_V3_REF=<commit-or-tag>
+ARG FLASH_ATTN_V3_REF=main
 RUN <<"EOF" bash -exu
-VIRTUAL_ENV=/opt/nemo_rl_venv \
-MAX_JOBS=${MAX_JOBS:-4} \
-TORCH_CUDA_ARCH_LIST="9.0 10.0" \
-uv pip install --no-build-isolation --upgrade \
-    "flash-attn @ git+https://github.com/Dao-AILab/flash-attention.git@${FLASH_ATTN_V3_REF}"
+git clone --depth 1 --branch ${FLASH_ATTN_V3_REF} \
+    https://github.com/Dao-AILab/flash-attention.git /tmp/flash-attn
+cd /tmp/flash-attn/hopper
+MAX_JOBS=${MAX_JOBS:-4} /opt/nemo_rl_venv/bin/python setup.py install
+rm -rf /tmp/flash-attn
 EOF
 
 ENV PATH="/opt/nemo_rl_venv/bin:$PATH"
