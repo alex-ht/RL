@@ -192,6 +192,17 @@ find /root/.cache/uv -type d -path "*ray/_private/runtime_env/agent/thirdparty_f
 echo "${CACHE_KEY}" > /root/.cache/uv/.cache-key
 EOF
 
+# Install Flash Attention v3 from source (Hopper sm_90/H100, Blackwell sm_100/B200).
+# Overrides the FA2 wheel installed by uv sync above; build takes ~30-60 min.
+# Override the ref via: --build-arg FLASH_ATTN_V3_REF=<tag-or-branch>
+ARG FLASH_ATTN_V3_REF=v3.0.0
+RUN <<"EOF" bash -exu
+MAX_JOBS=${MAX_JOBS:-4} \
+TORCH_CUDA_ARCH_LIST="9.0 10.0" \
+uv pip install --no-build-isolation --upgrade \
+    "flash-attn @ git+https://github.com/Dao-AILab/flash-attention.git@${FLASH_ATTN_V3_REF}"
+EOF
+
 ENV PATH="/opt/nemo_rl_venv/bin:$PATH"
 ENV NEMO_RL_VENV_DIR=/opt/ray_venvs
 # Point TE at the pip-installed cuDNN (nvidia-cudnn-cu12) instead of the system one.
