@@ -197,6 +197,7 @@ EOF
 # Override the ref via: --build-arg FLASH_ATTN_V3_REF=<tag-or-branch>
 ARG FLASH_ATTN_V3_REF=v3.0.0
 RUN <<"EOF" bash -exu
+VIRTUAL_ENV=/opt/nemo_rl_venv \
 MAX_JOBS=${MAX_JOBS:-4} \
 TORCH_CUDA_ARCH_LIST="9.0 10.0" \
 uv pip install --no-build-isolation --upgrade \
