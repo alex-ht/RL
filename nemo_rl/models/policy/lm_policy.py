@@ -15,6 +15,7 @@ import os
 import warnings
 from collections import defaultdict
 from contextlib import nullcontext
+from dataclasses import dataclass
 from typing import Any, Iterable, Optional, Union
 
 import numpy as np
@@ -72,6 +73,19 @@ from nemo_rl.utils.timer import Timer
 PathLike = Union[str, "os.PathLike[Any]"]
 
 _DIRECT_PACKED_SFT_REQUIRED_KEYS = MEGATRON_SFT_PACKED_BATCH_FIELDS
+
+
+@dataclass
+class TopkLogitsRequest:
+    """In-flight ``get_topk_logits`` call.
+
+    Create one with :meth:`Policy.submit_topk_logits` and finish it with
+    :meth:`Policy.collect_topk_logits`. Several teachers can be submitted
+    before any collect so their forwards overlap.
+    """
+
+    futures: Any
+    unsorted_data_indices: Optional[list[int]]
 
 
 def _aggregate_megatron_flops_metrics(
@@ -819,14 +833,28 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
 
         return logprobs
 
-    def get_topk_logits(
+    def submit_topk_logits(
         self,
         data: BatchedDataDict[GenerationDatumSpec],
         k: int,
         micro_batch_size: Optional[int] = None,
         timer: Optional[Timer] = None,
-    ) -> BatchedDataDict[TopkLogitsOutputSpec]:
-        """Dispatch get_topk_logits to workers (no CP/packed support initially)."""
+    ) -> TopkLogitsRequest:
+        """Shard a batch and launch top-k forwards without waiting.
+
+        If ``data`` contains ``extra_indices`` ``[B, S, K_extra]``, workers also
+        return logits at those token ids (``extra_logits``). Dynamic batching
+        reorders that tensor with the rest of the batch.
+
+        Args:
+            data: Batch to score. May include ``extra_indices``.
+            k: Teacher (or student) top-k width.
+            micro_batch_size: Optional logprob microbatch override.
+            timer: Optional step timer.
+
+        Returns:
+            Handle for :meth:`collect_topk_logits`.
+        """
         with timer.time("get_topk_logits/shard_data") if timer else nullcontext():
             sharded_data, unsorted_data_indices = self._shard_for_logprob(data)
 
@@ -851,20 +879,55 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
                 ],
                 common_kwargs={"k": k, "micro_batch_size": micro_batch_size},
             )
+        return TopkLogitsRequest(
+            futures=futures, unsorted_data_indices=unsorted_data_indices
+        )
 
+    def collect_topk_logits(
+        self, request: TopkLogitsRequest
+    ) -> BatchedDataDict[TopkLogitsOutputSpec]:
+        """Wait for a :meth:`submit_topk_logits` call and restore batch order.
+
+        Args:
+            request: Handle returned by :meth:`submit_topk_logits`.
+
+        Returns:
+            ``topk_logits`` and ``topk_indices``, plus ``extra_logits`` when the
+            request carried ``extra_indices``.
+        """
         # Avoid BatchedDataDict.from_batches here because it flattens rows for tensors with ndim>2 ([B,S,k] -> [B,S*k]).
-        worker_batches = self.worker_group.get_all_worker_results(futures)
+        worker_batches = self.worker_group.get_all_worker_results(request.futures)
         all_topk_logits = [wb["topk_logits"] for wb in worker_batches]
         all_topk_indices = [wb["topk_indices"] for wb in worker_batches]
 
         stacked: BatchedDataDict[TopkLogitsOutputSpec] = BatchedDataDict()
         stacked["topk_logits"] = torch.cat(all_topk_logits, dim=0)
         stacked["topk_indices"] = torch.cat(all_topk_indices, dim=0)
+        extra_logits = [wb.get("extra_logits") for wb in worker_batches]
+        if any(value is not None for value in extra_logits):
+            if any(value is None for value in extra_logits):
+                raise RuntimeError(
+                    "extra_logits was returned by some top-k workers but not all."
+                )
+            stacked["extra_logits"] = torch.cat(extra_logits, dim=0)
 
-        if unsorted_data_indices is not None:
-            stacked.reorder_data(unsorted_data_indices)
+        if request.unsorted_data_indices is not None:
+            stacked.reorder_data(request.unsorted_data_indices)
 
         return stacked
+
+    def get_topk_logits(
+        self,
+        data: BatchedDataDict[GenerationDatumSpec],
+        k: int,
+        micro_batch_size: Optional[int] = None,
+        timer: Optional[Timer] = None,
+    ) -> BatchedDataDict[TopkLogitsOutputSpec]:
+        """Dispatch get_topk_logits to workers and wait for the result."""
+        request = self.submit_topk_logits(
+            data, k, micro_batch_size=micro_batch_size, timer=timer
+        )
+        return self.collect_topk_logits(request)
 
     def get_full_logits_ipc(
         self,

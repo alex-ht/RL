@@ -493,6 +493,230 @@ def test_non_colocated_offloads_student_optimizer_before_teacher_inference(
     ]
 
 
+def test_union_mode_passes_student_topk_to_the_teacher(mock_components):
+    """Union mode scores the student first and sends those indices to the teacher."""
+    mock_components["master_config"].distillation.max_num_steps = 1
+    mock_components["loss_fn"].topk_mode = "union"
+    student_index = torch.arange(8).view(1, 2, 4)
+    mock_components["student_policy"].get_topk_logits.return_value = {
+        "topk_indices": student_index,
+        "topk_logits": torch.zeros(1, 2, 4),
+    }
+    teacher = mock_components["teacher_policy"]
+    teacher.get_topk_logits.return_value = {
+        "topk_indices": torch.zeros(1, 2, 4, dtype=torch.long),
+        "topk_logits": torch.zeros(1, 2, 4),
+        "extra_logits": torch.ones(1, 2, 4),
+    }
+
+    with patch(
+        "nemo_rl.algorithms.distillation.build_union_support",
+        return_value=(
+            torch.zeros(1, 2, 4, dtype=torch.long),
+            torch.ones(1, 2, 4, dtype=torch.bool),
+            torch.zeros(1, 2, 4),
+        ),
+    ) as mock_union:
+        distillation_train(
+            mock_components["student_policy"],
+            teacher,
+            mock_components["student_generation"],
+            mock_components["train_dataloader"],
+            mock_components["val_dataloader"],
+            mock_components["tokenizer"],
+            mock_components["loss_fn"],
+            mock_components["task_to_env"],
+            mock_components["val_task_to_env"],
+            mock_components["logger"],
+            mock_components["checkpointer"],
+            _initial_distillation_save_state(),
+            mock_components["master_config"],
+        )
+
+    teacher_batch = teacher.get_topk_logits.call_args.args[0]
+    assert torch.equal(teacher_batch["extra_indices"], student_index)
+    assert "task_name" not in teacher_batch
+    mock_union.assert_called_once()
+    # Non-colocated legacy teacher still offloads the student optimizer, and
+    # the student top-k happens before the teacher onload.
+    assert mock_components["student_policy"].offload_before_refit.call_count == 1
+    assert teacher.prepare_for_lp_inference.call_count == 1
+    assert mock_components["student_policy"].get_topk_logits.call_count == 1
+
+
+def test_resident_pool_does_not_offload_student_or_teachers(mock_components):
+    """Separate teacher clusters leave the student optimizer on the train GPUs."""
+    from nemo_rl.algorithms.distillation import MultiTeacherPool
+
+    mock_components["master_config"].distillation.max_num_steps = 1
+    pool = MultiTeacherPool(policies={}, task_to_alias={"math": "math"})
+    pool.get_topk_logits = MagicMock(
+        return_value={
+            "topk_logits": torch.zeros(1, 2, 4),
+            "topk_indices": torch.zeros(1, 2, 4, dtype=torch.long),
+            "teacher_ids": torch.zeros(1, dtype=torch.long),
+        }
+    )
+    pool.last_teacher_seconds = {"math": 0.25}
+    mock_components["loss_fn"].teacher_aliases = ["math"]
+
+    distillation_train(
+        mock_components["student_policy"],
+        pool,
+        mock_components["student_generation"],
+        mock_components["train_dataloader"],
+        mock_components["val_dataloader"],
+        mock_components["tokenizer"],
+        mock_components["loss_fn"],
+        mock_components["task_to_env"],
+        mock_components["val_task_to_env"],
+        mock_components["logger"],
+        mock_components["checkpointer"],
+        _initial_distillation_save_state(),
+        mock_components["master_config"],
+    )
+
+    teacher_batch = pool.get_topk_logits.call_args.args[0]
+    assert teacher_batch["task_name"] == ["math"]
+    mock_components["student_policy"].offload_before_refit.assert_not_called()
+    mock_components["student_policy"].get_topk_logits.assert_not_called()
+
+
+def test_master_config_teacher_sources_are_exclusive():
+    from nemo_rl.algorithms.distillation import (
+        DistillationTeacherConfig,
+        DistillationTeacherResources,
+    )
+
+    resources = DistillationTeacherResources(num_nodes=1, gpus_per_node=4)
+    math = DistillationTeacherConfig(
+        model_name="math-expert",
+        task_names=["DAPOMath17K"],
+        resources=resources,
+    )
+    code = DistillationTeacherConfig(
+        model_name="code-expert",
+        task_names=["DAPOMath17K"],
+        resources=resources,
+    )
+    both = MasterConfig.model_construct(
+        teacher={"model_name": "legacy"}, teachers={"math": math}
+    )
+    with pytest.raises(ValueError, match="exactly one"):
+        both._one_teacher_source()
+    neither = MasterConfig.model_construct(teacher=None, teachers=None)
+    with pytest.raises(ValueError, match="exactly one"):
+        neither._one_teacher_source()
+    duplicate = MasterConfig.model_construct(
+        teacher=None, teachers={"math": math, "code": code}
+    )
+    with pytest.raises(ValueError, match="claimed"):
+        duplicate._one_teacher_source()
+    ok = MasterConfig.model_construct(teacher=None, teachers={"math": math})
+    assert ok._one_teacher_source() is ok
+
+
+def test_build_teacher_policy_keeps_student_tokenizer_and_overrides_parallelism():
+    from nemo_rl.algorithms.distillation import (
+        DistillationTeacherAutomodelConfig,
+        DistillationTeacherConfig,
+        DistillationTeacherResources,
+        build_teacher_policy_config,
+    )
+
+    student = {
+        "model_name": "student-model",
+        "tokenizer": {"name": "student-model"},
+        "pretrained_checkpoint": {"path": "student-ckpt"},
+        "megatron_cfg": {"enabled": False},
+        "automodel_cfg": {
+            "enabled": True,
+            "expert_parallel_size": 32,
+            "tensor_parallel_size": 1,
+            "context_parallel_size": 1,
+        },
+    }
+    spec = DistillationTeacherConfig(
+        model_name="teacher-expert",
+        task_names=["DAPOMath17K"],
+        resources=DistillationTeacherResources(num_nodes=1, gpus_per_node=4),
+        automodel_cfg=DistillationTeacherAutomodelConfig(
+            expert_parallel_size=4,
+            tensor_parallel_size=1,
+            context_parallel_size=1,
+        ),
+    )
+    built = build_teacher_policy_config(student, spec)
+    assert built["model_name"] == "teacher-expert"
+    assert built["tokenizer"]["name"] == "student-model"
+    assert "pretrained_checkpoint" not in built
+    assert built["automodel_cfg"]["expert_parallel_size"] == 4
+    assert built["automodel_cfg"]["enabled"] is True
+    assert student["automodel_cfg"]["expert_parallel_size"] == 32
+
+
+def test_distillation_yaml_parses_legacy_teacher_and_union_recipe():
+    """CPU parse of the exemplar and the 8-node Gemma-4 recipe."""
+    from omegaconf import OmegaConf
+
+    from nemo_rl.algorithms.distillation_topk import resident_teacher_node_count
+    from nemo_rl.utils.config import load_config, register_omegaconf_resolvers
+
+    register_omegaconf_resolvers()
+    legacy = OmegaConf.to_container(
+        load_config("examples/configs/distillation_math.yaml"), resolve=True
+    )
+    legacy_cfg = MasterConfig(**legacy)
+    assert legacy_cfg.teacher is not None
+    assert legacy_cfg.teachers is None
+    assert legacy_cfg.loss_fn.topk_mode == "teacher"
+    assert legacy_cfg.loss_fn.final_logit_softcapping is None
+
+    recipe = OmegaConf.to_container(
+        load_config(
+            "examples/configs/recipes/llm/"
+            "distillation-gemma4-26ba4b-it-8n8g-automodel-ep32-multiteacher.yaml"
+        ),
+        resolve=True,
+    )
+    recipe_cfg = MasterConfig(**recipe)
+    assert recipe_cfg.teacher is None
+    assert recipe_cfg.loss_fn.topk_mode == "union"
+    assert recipe_cfg.loss_fn.kl_type == "reverse"
+    assert recipe_cfg.loss_fn.zero_outside_topk is False
+    assert recipe_cfg.loss_fn.final_logit_softcapping is None
+    assert recipe_cfg.cluster.segment_size is None
+    assert len(recipe_cfg.teachers) == 4
+    teacher_gpus = [
+        spec.resources.num_nodes * spec.resources.gpus_per_node
+        for spec in recipe_cfg.teachers.values()
+    ]
+    teacher_nodes = resident_teacher_node_count(
+        teacher_gpus, recipe_cfg.cluster.gpus_per_node
+    )
+    inference_nodes = recipe_cfg.policy["generation"]["colocated"]["resources"][
+        "num_nodes"
+    ]
+    assert teacher_nodes == 2
+    assert inference_nodes == 2
+    assert recipe_cfg.cluster.num_nodes - teacher_nodes - inference_nodes == 4
+    assert recipe_cfg.policy["automodel_cfg"]["expert_parallel_size"] == 32
+    for spec in recipe_cfg.teachers.values():
+        assert spec.resources.num_nodes == 1
+        assert spec.resources.gpus_per_node == 4
+        assert spec.automodel_cfg.expert_parallel_size == 4
+        assert spec.automodel_cfg.context_parallel_size == 1
+
+    with pytest.raises(ValueError, match="reverse"):
+        DistillationLossConfig(
+            kl_type="forward", topk_mode="union", zero_outside_topk=False
+        )
+    with pytest.raises(ValueError, match="zero_outside_topk"):
+        DistillationLossConfig(
+            kl_type="reverse", topk_mode="union", zero_outside_topk=True
+        )
+
+
 def test_colocated_does_not_offload_student_optimizer_before_teacher_inference(
     mock_components,
 ):

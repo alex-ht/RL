@@ -19,6 +19,7 @@ import torch
 import torch.distributed.nn.functional
 from torch.distributed.tensor import DTensor
 
+from nemo_rl.algorithms.distillation_topk import apply_final_logit_softcap
 from nemo_rl.algorithms.logits_sampling_utils import (
     TrainingSamplingParams,
     apply_top_k_top_p,
@@ -1861,6 +1862,18 @@ def gather_logits_at_global_indices(
     return gathered_logits
 
 
+def _mask_distillation_support(
+    logits: torch.Tensor, index_mask: Optional[torch.Tensor]
+) -> torch.Tensor:
+    """Set padded union slots to -inf so they drop out of log_softmax."""
+    if index_mask is None:
+        return logits
+    mask = index_mask
+    if mask.shape[1] != logits.shape[1]:
+        mask = mask[:, : logits.shape[1]]
+    return logits.masked_fill(~mask.to(device=logits.device), float("-inf"))
+
+
 def get_distillation_topk_logprobs_from_logits(
     student_logits: torch.Tensor,
     teacher_topk_logits: torch.Tensor,
@@ -1871,8 +1884,17 @@ def get_distillation_topk_logprobs_from_logits(
     vocab_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
     context_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
     cp_sharder: Optional["ContextParallelSharder"] = None,
+    index_mask: Optional[torch.Tensor] = None,
+    logit_softcap: Optional[float] = None,
 ):
-    """Compute top-k log probabilities from logits."""
+    """Compute top-k log probabilities from logits.
+
+    ``index_mask`` (union mode) marks real support slots. Both sides are
+    log-softmaxed on that support, which renormalizes the KL inside the union.
+    ``logit_softcap`` applies Gemma final-logit softcapping to both sides
+    before that log-softmax. Leave it unset when the model forward already
+    softcapped.
+    """
     if teacher_topk_indices.shape[-1] <= 0:
         raise ValueError(
             f"topk must be positive, got {teacher_topk_indices.shape[-1]}. "
@@ -1881,6 +1903,8 @@ def get_distillation_topk_logprobs_from_logits(
 
     # Ensure float32 for stability
     student_logits = student_logits.to(torch.float32)
+    if logit_softcap is not None:
+        student_logits = apply_final_logit_softcap(student_logits, logit_softcap)
     # Move teacher topk indices to the same device as student logits
     teacher_topk_indices = teacher_topk_indices.to(student_logits.device)
 
@@ -1888,6 +1912,15 @@ def get_distillation_topk_logprobs_from_logits(
     # must not drive the layout work below.
     cp_group = None if cp_sharder is not None else context_parallel_group
     cp_size = 1 if cp_group is None else torch.distributed.get_world_size(cp_group)
+    if index_mask is not None and (cp_sharder is not None or cp_size > 1):
+        raise NotImplementedError(
+            "Union top-k distillation does not support context parallelism."
+        )
+    if index_mask is not None and zero_outside_topk:
+        raise ValueError(
+            "union_mask requires zero_outside_topk=False so both sides "
+            "renormalize inside the union."
+        )
 
     # Process based on the student logits type
     if vocab_parallel_group is not None:
@@ -2008,6 +2041,9 @@ def get_distillation_topk_logprobs_from_logits(
                 dim=-1, index=indices_for_logits
             )
 
+        student_topk_logits = _mask_distillation_support(
+            student_topk_logits, index_mask
+        )
         student_topk_logprobs = torch.nn.functional.log_softmax(
             student_topk_logits, dim=-1
         )
@@ -2023,6 +2059,11 @@ def get_distillation_topk_logprobs_from_logits(
     teacher_topk_logits = teacher_topk_logits.to(
         student_topk_logprobs.device, dtype=student_topk_logprobs.dtype
     )
+    if logit_softcap is not None:
+        teacher_topk_logits = apply_final_logit_softcap(
+            teacher_topk_logits, logit_softcap
+        )
+    teacher_topk_logits = _mask_distillation_support(teacher_topk_logits, index_mask)
     teacher_topk_logprobs = torch.nn.functional.log_softmax(teacher_topk_logits, dim=-1)
 
     # Single point of next-token alignment after TP/CP processing
