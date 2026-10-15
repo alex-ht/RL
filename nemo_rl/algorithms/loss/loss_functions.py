@@ -24,8 +24,9 @@ from typing import (
 )
 
 import torch
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
+from nemo_rl.algorithms.distillation_topk import per_token_distillation_kl
 from nemo_rl.algorithms.loss.clipped_pg import (
     clipped_pg_actor_objective,
     clipped_pg_diagnostic_metrics,
@@ -1813,9 +1814,50 @@ class MPOLossFn(PreferenceLossFn):
 
 
 class DistillationLossConfig(BaseModel, extra="allow"):
+    """On-policy distillation loss.
+
+    ``topk_mode="teacher"`` (default) matches the historical estimator: KL on
+    the teacher's top-k, renormalized inside that set when
+    ``zero_outside_topk`` is false.
+
+    ``topk_mode="union"`` is the MiniCPM5-1B estimator: reverse KL on the union
+    of the student top-k and the teacher top-k, again renormalized inside that
+    union. It requires ``kl_type="reverse"`` and ``zero_outside_topk=false``.
+
+    ``final_logit_softcapping`` applies Gemma's ``cap * tanh(logits / cap)`` to
+    both the student and teacher logits before the log-softmax. Leave it unset
+    when the model forward already softcaps (Gemma-4 Automodel / Megatron use
+    30 inside the forward). Setting it again would cap twice.
+    """
+
     kl_type: str = "mixed"
     mixed_kl_weight: float = 0.5
     zero_outside_topk: bool = False
+    topk_mode: Literal["teacher", "union"] = "teacher"
+    final_logit_softcapping: Optional[float] = None
+
+    @model_validator(mode="after")
+    def _check_union_mode(self) -> "DistillationLossConfig":
+        if self.topk_mode == "union":
+            if self.kl_type != "reverse":
+                raise ValueError(
+                    "loss_fn.topk_mode='union' requires loss_fn.kl_type='reverse' "
+                    f"(got {self.kl_type!r})."
+                )
+            if self.zero_outside_topk:
+                raise ValueError(
+                    "loss_fn.topk_mode='union' renormalizes inside the union and "
+                    "is incompatible with zero_outside_topk=true."
+                )
+        if (
+            self.final_logit_softcapping is not None
+            and self.final_logit_softcapping <= 0
+        ):
+            raise ValueError(
+                "loss_fn.final_logit_softcapping must be positive, got "
+                f"{self.final_logit_softcapping}."
+            )
+        return self
 
 
 class DistillationLossDataDict(TypedDict):
@@ -1825,6 +1867,10 @@ class DistillationLossDataDict(TypedDict):
     sample_mask: torch.Tensor
     teacher_topk_logits: torch.Tensor
     teacher_topk_indices: torch.Tensor
+    # Union mode: True on real union members, False on width padding.
+    union_mask: NotRequired[torch.Tensor]
+    # Row -> teacher alias id. Used for per-teacher KL metrics.
+    teacher_ids: NotRequired[torch.Tensor]
 
 
 class DistillationLossFn(LossFunction):
@@ -1837,6 +1883,10 @@ class DistillationLossFn(LossFunction):
         self.kl_type = cfg.kl_type
         self.mixed_kl_weight = cfg.mixed_kl_weight
         self.zero_outside_topk = cfg.zero_outside_topk
+        self.topk_mode = cfg.topk_mode
+        self.final_logit_softcapping = cfg.final_logit_softcapping
+        # Filled by distillation.setup. Empty skips per-teacher metrics.
+        self.teacher_aliases: list[str] = []
         self.log_infinitesimal = -100
 
         assert self.kl_type in ["forward", "reverse", "mixed"], "Invalid KL type"
@@ -1853,10 +1903,21 @@ class DistillationLossFn(LossFunction):
         global_valid_seqs: torch.Tensor,
         global_valid_toks: torch.Tensor,
     ) -> tuple[torch.Tensor, dict[str, Any]]:
-        """Compute distillation loss between teacher and student logits."""
-        student_probs = student_topk_logprobs.exp()  # [B, S-1, k]
-        teacher_probs = teacher_topk_logprobs.exp()  # [B, S-1, k]
+        """Compute distillation loss between teacher and student logits.
 
+        In union mode the incoming log-probabilities are already renormalized
+        on the union (see ``distillation_topk``). ``union_mask`` zeros padded
+        slots so ``-inf`` padding cannot NaN the reverse KL.
+        """
+        support_mask = None
+        if "union_mask" in data and data["union_mask"] is not None:
+            support_mask = data["union_mask"]
+            if support_mask.shape[1] == student_topk_logprobs.shape[1] + 1:
+                support_mask = support_mask[:, :-1, :]
+            else:
+                support_mask = support_mask[:, : student_topk_logprobs.shape[1], :]
+
+        student_probs = student_topk_logprobs.exp()  # [B, S-1, k]
         loss_correction_term = torch.zeros_like(student_probs[..., 0])  # [B, S-1]
         if self.zero_outside_topk and self.kl_type != "forward":
             H_rest = H_all - (student_probs * student_topk_logprobs).sum(-1)
@@ -1868,24 +1929,16 @@ class DistillationLossFn(LossFunction):
                     1.0 - self.mixed_kl_weight
                 )
 
-        if self.kl_type == "forward":
-            per_token_kl = teacher_probs * (
-                teacher_topk_logprobs - student_topk_logprobs
-            )
-        elif self.kl_type == "reverse":
-            per_token_kl = student_probs * (
-                student_topk_logprobs - teacher_topk_logprobs
-            )
-        else:
-            # mixed KL
-            kl_forward = teacher_probs * (teacher_topk_logprobs - student_topk_logprobs)
-            kl_reverse = student_probs * (student_topk_logprobs - teacher_topk_logprobs)
-            per_token_kl = (
-                self.mixed_kl_weight * kl_forward
-                + (1.0 - self.mixed_kl_weight) * kl_reverse
-            )
-
-        per_token_kl = per_token_kl.sum(dim=-1) + loss_correction_term  # [B, S-1]
+        # Dense teacher-topk (support_mask is None) matches the historical
+        # per-token sum. Union padding takes the masked branch.
+        per_token_kl = per_token_distillation_kl(
+            student_topk_logprobs,
+            teacher_topk_logprobs,
+            kl_type=self.kl_type,
+            mixed_kl_weight=self.mixed_kl_weight,
+            support_mask=support_mask,
+        )
+        per_token_kl = per_token_kl + loss_correction_term  # [B, S-1]
 
         # Masking and reduction
         if "token_mask" in data and "sample_mask" in data:
@@ -1908,8 +1961,51 @@ class DistillationLossFn(LossFunction):
             "loss": float(kl_loss.item()) if kl_loss.ndim == 0 else kl_loss,
             "num_valid_samples": data["input_ids"].shape[0],
         }
+        position_mask = None
+        if "token_mask" in data and "sample_mask" in data:
+            position_mask = mask
+        self._add_teacher_metrics(
+            metrics,
+            per_token_kl.detach(),
+            data,
+            support_mask=support_mask,
+            position_mask=position_mask,
+        )
 
         return kl_loss, metrics
+
+    def _add_teacher_metrics(
+        self,
+        metrics: dict[str, Any],
+        per_token_kl: torch.Tensor,
+        data: DistillationLossDataDict,
+        *,
+        support_mask: torch.Tensor | None,
+        position_mask: torch.Tensor | None,
+    ) -> None:
+        """Record sum/count metrics the driver reduces into per-teacher means.
+
+        Sums (not means) so microbatch and data-parallel aggregation can add
+        them. ``kl/{alias}`` and ``union_size`` are formed in the train loop.
+        """
+        if position_mask is None:
+            position_mask = torch.ones_like(per_token_kl)
+
+        if support_mask is not None:
+            sizes = support_mask.to(dtype=per_token_kl.dtype).sum(dim=-1)
+            metrics["union_size_sum"] = float((sizes * position_mask).sum().item())
+            metrics["union_size_count"] = float(position_mask.sum().item())
+
+        if not self.teacher_aliases or "teacher_ids" not in data:
+            return
+        teacher_ids = data["teacher_ids"]
+        for teacher_index, alias in enumerate(self.teacher_aliases):
+            selected = (teacher_ids == teacher_index).to(dtype=per_token_kl.dtype)
+            selected = selected.unsqueeze(-1) * position_mask
+            metrics[f"teacher_kl_sum/{alias}"] = float(
+                (per_token_kl * selected).sum().item()
+            )
+            metrics[f"teacher_kl_count/{alias}"] = float(selected.sum().item())
 
 
 class MseValueLossConfig(BaseModel, extra="forbid"):

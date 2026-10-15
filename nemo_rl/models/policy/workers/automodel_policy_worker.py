@@ -765,6 +765,7 @@ class AutomodelPolicyWorkerImpl(
 
         out_topk_vals = []
         out_topk_idx = []
+        out_extra = []
         self.model.eval()
 
         # Create top-k post-processor
@@ -800,7 +801,7 @@ class AutomodelPolicyWorkerImpl(
 
                 with prepared.model_context_factory(), self._autocast_context():
                     # Use forward_with_post_processing_fn for forward pass and post-processing
-                    (vals, idx), _metrics, _ = forward_with_post_processing_fn(
+                    result, _metrics, _ = forward_with_post_processing_fn(
                         model=self.model,
                         prepared=prepared,
                         post_processing_fn=topk_post_processor,
@@ -808,6 +809,8 @@ class AutomodelPolicyWorkerImpl(
                         sampling_params=self.sampling_params,
                         sequence_dim=sequence_dim,
                     )
+                vals, idx = result[0], result[1]
+                extra = result[2] if len(result) == 3 else None
 
                 # skip keeping the topk values for the dummy batches
                 if batch_idx >= iterator_len:
@@ -817,6 +820,8 @@ class AutomodelPolicyWorkerImpl(
                 # Shapes remain [B, S, k].
                 out_topk_vals.append(vals.cpu())
                 out_topk_idx.append(idx.cpu())
+                if extra is not None:
+                    out_extra.append(extra.cpu())
 
         ret = BatchedDataDict[Any]()
         # Pad each micro-batch result on sequence dim to common length (S), similar to get_logprobs
@@ -826,6 +831,10 @@ class AutomodelPolicyWorkerImpl(
         ret["topk_indices"] = pad_and_concat(
             out_topk_idx, target_len=seq_dim_size
         ).cpu()
+        if out_extra:
+            ret["extra_logits"] = pad_and_concat(
+                out_extra, target_len=seq_dim_size
+            ).cpu()
         return ret
 
     def get_full_logits_ipc(

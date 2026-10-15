@@ -61,6 +61,7 @@ from nemo_rl.distributed.model_utils import (
     distributed_vocab_topk,
     from_parallel_logits_to_logprobs,
     from_parallel_logits_to_logprobs_packed_sequences,
+    gather_logits_at_global_indices,
 )
 from nemo_rl.models.megatron.config import MegatronModule
 from nemo_rl.models.megatron.data import ProcessedMicrobatch
@@ -1202,6 +1203,27 @@ class TopkLogitsPostProcessor:
                 chunk_size=chunk_size,
             )
 
+            extra_payload: dict[str, torch.Tensor] = {}
+            if "extra_indices" in data_dict and data_dict["extra_indices"] is not None:
+                if pack or cp_size > 1:
+                    raise NotImplementedError(
+                        "Gathering logits at student top-k indices does not support "
+                        "sequence packing or context parallelism. Disable both for "
+                        "union top-k distillation."
+                    )
+                extra_indices = data_dict["extra_indices"].to(
+                    device=output_tensor.device, dtype=torch.long
+                )
+                extra_logits = gather_logits_at_global_indices(
+                    output_tensor,
+                    extra_indices,
+                    tp_grp,
+                    vocab_start_index=vocab_start_index,
+                    vocab_end_index=vocab_start_index + vocab_shard_size,
+                    chunk_size=chunk_size,
+                )
+                extra_payload["extra_logits"] = extra_logits[:, :original_seq_length]
+
             if self.cfg["megatron_cfg"]["context_parallel_size"] > 1:
                 cp_grp = get_context_parallel_group()
                 if pack:
@@ -1289,15 +1311,19 @@ class TopkLogitsPostProcessor:
                         out_idx[i, :seq_len, :] = topk_idx_full[
                             0, start_idx : start_idx + seq_len, :
                         ]
-                return output_tensor.new_zeros(()), {
+                packed_payload = {
                     "topk_logits": out_vals,
                     "topk_indices": out_idx,
                 }
+                packed_payload.update(extra_payload)
+                return output_tensor.new_zeros(()), packed_payload
             else:
-                return output_tensor.new_zeros(()), {
+                dense_payload = {
                     "topk_logits": topk_vals_full[:, :original_seq_length],
                     "topk_indices": topk_idx_full[:, :original_seq_length],
                 }
+                dense_payload.update(extra_payload)
+                return output_tensor.new_zeros(()), dense_payload
 
         return processor_fn_inner
 

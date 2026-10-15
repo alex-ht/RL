@@ -53,6 +53,7 @@ from nemo_rl.algorithms.utils import mask_filtered_logprobs_outside_tokens
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.model_utils import (
     distributed_vocab_topk,
+    gather_logits_at_global_indices,
     get_cp_sharded_next_token_logprobs,
     get_logprobs_from_vocab_parallel_logits,
 )
@@ -391,6 +392,13 @@ def forward_with_post_processing_fn(
         )
         if isinstance(post_processing_fn, LogprobsPostProcessor):
             metrics = {"logprobs": result}
+        elif len(result) == 3:
+            vals, idx, extra = result
+            metrics = {
+                "topk_logits": vals,
+                "topk_indices": idx,
+                "extra_logits": extra,
+            }
         else:
             vals, idx = result
             metrics = {"topk_logits": vals, "topk_indices": idx}
@@ -971,6 +979,10 @@ class TopkLogitsPostProcessor:
                 full_logits = logits.to(torch.float32)
                 vals, idx = torch.topk(full_logits, k=self.k, dim=-1)
 
+        extra_vals = self._extra_logits_at_indices(
+            logits, data_dict, cp_sharder=cp_sharder
+        )
+
         # Handle sequence packing unpacking
         if self.enable_seq_packing:
             # Unpack top-k results from packed format back to original batch format
@@ -1005,7 +1017,50 @@ class TopkLogitsPostProcessor:
             vals = unpacked_vals
             idx = unpacked_idx
 
-        return vals, idx
+        if extra_vals is None:
+            return vals, idx
+        return vals, idx, extra_vals
+
+    def _extra_logits_at_indices(
+        self,
+        logits: torch.Tensor,
+        data_dict: BatchedDataDict[Any],
+        *,
+        cp_sharder: Optional[ContextParallelSharder],
+    ) -> Optional[torch.Tensor]:
+        """Gather logits at ``data_dict['extra_indices']`` when the caller set them.
+
+        Union top-k needs the teacher distribution on the student's top-k ids,
+        including ids outside the teacher's own top-k. Sequence packing and
+        context parallelism are rejected: the distillation driver does not
+        enable union mode with either.
+        """
+        if "extra_indices" not in data_dict or data_dict["extra_indices"] is None:
+            return None
+        if self.enable_seq_packing or cp_sharder is not None:
+            raise NotImplementedError(
+                "Gathering logits at student top-k indices does not support "
+                "sequence packing or context parallelism. Disable both for "
+                "union top-k distillation."
+            )
+        extra_indices = data_dict["extra_indices"]
+        if isinstance(logits, DTensor):
+            local_logits = logits.to_local()
+            tp_group = self.tp_mesh.get_group()
+            tp_rank = torch.distributed.get_rank(tp_group)
+            vocab_local = int(local_logits.shape[-1])
+            return gather_logits_at_global_indices(
+                local_logits,
+                extra_indices.to(device=local_logits.device, dtype=torch.long),
+                tp_group=tp_group,
+                vocab_start_index=tp_rank * vocab_local,
+                vocab_end_index=(tp_rank + 1) * vocab_local,
+            )
+        full_logits = logits.to(torch.float32)
+        return full_logits.gather(
+            dim=-1,
+            index=extra_indices.to(device=full_logits.device, dtype=torch.long),
+        )
 
 
 class FullLogitsPostProcessor:
