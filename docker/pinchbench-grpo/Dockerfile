@@ -8,8 +8,9 @@
 #
 # Layered on the prebuilt NeMo-RL image (torch/vLLM cu130 wheels on a CUDA
 # 13.2 cuda-dl-base; needs host driver >= R580 -- R580 runs 13.2 via the
-# bundled forward-compat libs in /usr/local/cuda/compat). Nothing here compiles
-# CUDA code, so a plain `docker build` is fine (no lowmem builder needed).
+# bundled forward-compat libs in /usr/local/cuda/compat). Nothing here should
+# compile CUDA code; the steps that could build anything from source are capped
+# by BUILD_MAX_JOBS (see the Gym venv prefetch below) to keep host RAM bounded.
 #
 # Build (context = this directory; see build_and_push.sh):
 #   docker build --build-arg RL_COMMIT=$(git rev-parse HEAD) \
@@ -27,6 +28,9 @@ ARG PINCHBENCH_SKILL_REPO=https://github.com/alex-ht/skill.git
 ARG PINCHBENCH_SKILL_COMMIT=2d2bbdba8737b142fe1ed608711e68be594abbc6
 ARG RL_COMMIT=unknown
 ARG BASE_IMAGE
+# Max parallel compile jobs for anything that builds from source in this image
+# (node-gyp addons, sdist-only Python wheels). Keep low on RAM-limited hosts.
+ARG BUILD_MAX_JOBS=2
 
 LABEL org.opencontainers.image.source="https://github.com/alex-ht/RL" \
       org.opencontainers.image.description="NeMo-RL + PinchBench/OpenClaw local-subprocess rollouts (GRPO on PinchBench research tasks)" \
@@ -54,7 +58,9 @@ RUN ln -sf ../lib/node_modules/npm/bin/npm-cli.js /usr/local/bin/npm \
     && node --version && npm --version
 
 # OpenClaw + fws, pinned. fws' MITM proxy hard-codes /tmp: patch it to $TMPDIR.
-RUN npm install -g --no-fund --no-audit "openclaw@${OPENCLAW_VERSION}" "@juppytt/fws@${FWS_VERSION}" \
+# JOBS / npm_config_jobs cap node-gyp's make -j for any native addon.
+RUN JOBS="${BUILD_MAX_JOBS}" npm_config_jobs="${BUILD_MAX_JOBS}" \
+    npm install -g --no-fund --no-audit "openclaw@${OPENCLAW_VERSION}" "@juppytt/fws@${FWS_VERSION}" \
     && npm cache clean --force \
     && openclaw --version | grep -q "${OPENCLAW_VERSION}" \
     && fws --version
@@ -72,7 +78,8 @@ RUN git clone --filter=blob:none "${PINCHBENCH_SKILL_REPO}" /opt/pinchbench \
 # System python (the one OpenClaw's exec tool and benchmark.py use) deps:
 # benchmark.py needs pyyaml; research-task agents commonly use requests/bs4/
 # lxml/pandas; graders may run pytest. Kept out of the NeMo-RL venvs.
-RUN uv pip install --system --break-system-packages --python /usr/bin/python3 --no-cache \
+RUN UV_CONCURRENT_BUILDS=1 MAX_JOBS="${BUILD_MAX_JOBS}" \
+    uv pip install --system --break-system-packages --python /usr/bin/python3 --no-cache \
         pyyaml requests beautifulsoup4 lxml pandas numpy matplotlib python-dateutil \
         tabulate openpyxl pypdf pdfplumber pytest \
     && /usr/bin/python3 -c "import yaml, requests, bs4, lxml, pandas, pypdf, pdfplumber, pytest; print('task deps OK')"
@@ -92,13 +99,45 @@ RUN chmod 0755 /opt/nemo-rl/3rdparty/Gym-workspace/Gym/responses_api_agents/pinc
 # Bake the Gym server venvs (vllm_model proxy + pinchbench agent) into
 # /opt/gym_venvs: under enroot the rootfs is read-only, so Gym cannot create
 # them at runtime. Same mechanism as docker/Dockerfile NEMO_GYM_PREFETCH_CONFIGS.
-RUN cd /opt/nemo-rl \
-    && UV_LINK_MODE=symlink uv run --frozen python examples/nemo_gym/prefetch_venvs.py \
-        /opt/pinchbench-grpo/prefetch_pinchbench_envs.yaml 2>&1 | tee /opt/pinchbench-grpo/prefetch.log \
-    && grep -q "Succeeded: 1" /opt/pinchbench-grpo/prefetch.log \
-    && ls -la "${NEMO_GYM_VENV_DIR}" \
-    && find /opt/gym_venvs -name ray_dist.jar -delete \
-    && chmod -R a+rX /opt/gym_venvs
+#
+# Memory guards (a workstation build must not OOM the host):
+# * `--no-sync` + the base image's main venv: a plain `uv run --frozen` re-syncs
+#   /opt/nemo_rl_venv first, and if uv ever decides a no-build-isolation CUDA
+#   package (TE, flash-attn, mamba, deep_ep, ...) needs rebuilding it would
+#   compile with nproc-wide nvcc/cc1plus jobs. Nothing in this image should be
+#   compiled; the venv in the base image is used as-is.
+# * MAX_JOBS / NVTE_BUILD_* / CMAKE_BUILD_PARALLEL_LEVEL / UV_CONCURRENT_*:
+#   should anything still build from source (e.g. a Gym server dep without a
+#   cp313 wheel), cap its parallelism. Build-time only (ARG, not ENV).
+# * A pre-started Ray head with few CPUs and a small object store: otherwise
+#   ray.init() sizes itself to the whole host (all cores, ~30% of RAM for the
+#   object store) and init_ray() just reuses this cluster (matching nrl_tag).
+# * /tmp/ray is removed so the Ray session (sockets, logs) is not baked in.
+ARG BUILD_RAY_CPUS=2
+ARG BUILD_RAY_OBJECT_STORE_BYTES=536870912
+RUN <<"EOF" bash -exuo pipefail
+export MAX_JOBS="${BUILD_MAX_JOBS}" \
+    NVTE_BUILD_MAX_JOBS="${BUILD_MAX_JOBS}" NVTE_BUILD_THREADS_PER_JOB=1 \
+    CMAKE_BUILD_PARALLEL_LEVEL="${BUILD_MAX_JOBS}" MAKEFLAGS="-j${BUILD_MAX_JOBS}" \
+    NINJAFLAGS="-j${BUILD_MAX_JOBS}" \
+    UV_CONCURRENT_BUILDS=1 UV_CONCURRENT_INSTALLS="${BUILD_MAX_JOBS}" UV_CONCURRENT_DOWNLOADS=4 \
+    RAY_USAGE_STATS_ENABLED=0
+cd /opt/nemo-rl
+ray start --head --disable-usage-stats --include-dashboard=false \
+    --num-cpus="${BUILD_RAY_CPUS}" --num-gpus=0 \
+    --object-store-memory="${BUILD_RAY_OBJECT_STORE_BYTES}" \
+    --resources='{"nrl_tag_ALL": 1}'
+rc=0
+UV_LINK_MODE=symlink uv run --no-sync python examples/nemo_gym/prefetch_venvs.py \
+    /opt/pinchbench-grpo/prefetch_pinchbench_envs.yaml 2>&1 | tee /opt/pinchbench-grpo/prefetch.log || rc=$?
+ray stop --force || true
+rm -rf /tmp/ray
+test "${rc}" -eq 0
+grep -q "Succeeded: 1" /opt/pinchbench-grpo/prefetch.log
+ls -la "${NEMO_GYM_VENV_DIR}"
+find /opt/gym_venvs -name ray_dist.jar -delete
+chmod -R a+rX /opt/gym_venvs
+EOF
 
 ENV PINCHBENCH_SKILL_DIR=/opt/pinchbench \
     PINCHBENCH_PYTHON=/usr/bin/python3 \
