@@ -543,7 +543,7 @@ index 00000000..b3a104e4
 +exit "$rc"
 diff --git a/responses_api_agents/pinchbench/tests/test_local_provider.py b/responses_api_agents/pinchbench/tests/test_local_provider.py
 new file mode 100644
-index 00000000..c0007dd0
+index 00000000..551a7e27
 --- /dev/null
 +++ b/responses_api_agents/pinchbench/tests/test_local_provider.py
 @@ -0,0 +1,194 @@
@@ -653,7 +653,7 @@ index 00000000..c0007dd0
 +        """
 +        out="$PINCHBENCH_WORK_BASE/out"; mkdir -p "$out"
 +        # leave a straggler behind; the agent must reap the process group
-+        (sleep 300 &) ; echo $$ > "$PINCHBENCH_WORK_BASE/../pid_$TASK_ID"
++        (sleep 300 &) ; echo $$ > "$PINCHBENCH_WORK_BASE/pid"
 +        python3 - <<'PY'
 +        import json, os
 +        assert os.environ["PINCHBENCH_WORK_BASE"]

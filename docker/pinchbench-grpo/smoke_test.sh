@@ -34,15 +34,17 @@ PY
 cd "$W"
 /opt/nemo_rl_venv/bin/python -c "import nemo_rl, torch; print('PASS: import nemo_rl', nemo_rl.__file__, 'torch', torch.__version__, 'cuda', torch.version.cuda)"
 GYM=/opt/nemo-rl/3rdparty/Gym-workspace/Gym
-PYTHONPATH="$GYM" /opt/nemo_rl_venv/bin/python -c "
+GYMPY=/opt/gym_venvs/responses_api_agents/pinchbench/.venv/bin/python   # baked pinchbench agent venv
+test -x "$GYMPY" && pass "baked Gym venvs: $(ls /opt/gym_venvs/*/ | tr '\n' ' ')"
+PYTHONPATH="$GYM" "$GYMPY" -c "
 from responses_api_agents.pinchbench.app import resolve_local_work_root, LOCAL_PROVIDER
 print('PASS: gym pinchbench agent (local provider) importable')"
-if /opt/nemo_rl_venv/bin/python -c "import pytest, pytest_asyncio" 2>/dev/null; then
-  PYTHONPATH="$GYM" /opt/nemo_rl_venv/bin/python -m pytest -q -p no:cacheprovider \
+if "$GYMPY" -c "import pytest, pytest_asyncio" 2>/dev/null; then
+  PYTHONPATH="$GYM" "$GYMPY" -m pytest -q -p no:cacheprovider \
     --basetemp="$W/pytest" --rootdir="$GYM" \
-    "$GYM/responses_api_agents/pinchbench/tests/test_local_provider.py" \
-    && pass "gym local-provider unit tests"
+    "$GYM/responses_api_agents/pinchbench/tests/" \
+    && pass "gym pinchbench agent unit tests (incl. local provider)"
 else
-  echo "SKIP: pytest/pytest-asyncio not in /opt/nemo_rl_venv"
+  echo "SKIP: pytest/pytest-asyncio not in $GYMPY"
 fi
 echo "SMOKE OK"
