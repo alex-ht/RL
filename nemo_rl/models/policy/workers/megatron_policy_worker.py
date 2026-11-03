@@ -2916,6 +2916,10 @@ class MegatronPolicyWorkerImpl(
             model_slices_context_parallel_inputs=self.model_slices_context_parallel_inputs,
         )
 
+        # Every PP rank must agree on the broadcast keys. ``extra_indices`` is
+        # part of the input batch, so non-last stages know to expect the tensor
+        # even when their local forward returns nothing.
+        wants_extra = "extra_indices" in data and data["extra_indices"] is not None
         if parallel_state.is_pipeline_last_stage(ignore_virtual=True):
             topk_logits = pad_and_concat(
                 [o["topk_logits"] for o in list_of_outputs], target_len=seq_length
@@ -2928,11 +2932,17 @@ class MegatronPolicyWorkerImpl(
                 "topk_logits": topk_logits,
                 "topk_indices": topk_indices,
             }
+            if wants_extra:
+                tensors_to_broadcast["extra_logits"] = pad_and_concat(
+                    [o["extra_logits"] for o in list_of_outputs], target_len=seq_length
+                )
         else:
             tensors_to_broadcast = {
                 "topk_logits": None,
                 "topk_indices": None,
             }
+            if wants_extra:
+                tensors_to_broadcast["extra_logits"] = None
 
         # Broadcast tensors from last stage to all stages
         broadcasted = broadcast_tensors_from_last_stage(tensors_to_broadcast)
@@ -2940,9 +2950,13 @@ class MegatronPolicyWorkerImpl(
         topk_indices = broadcasted["topk_indices"]
 
         no_grad.__exit__(None, None, None)
-        return BatchedDataDict.from_batches(
-            [{"topk_logits": topk_logits.cpu(), "topk_indices": topk_indices.cpu()}]
-        )
+        gathered = {
+            "topk_logits": topk_logits.cpu(),
+            "topk_indices": topk_indices.cpu(),
+        }
+        if wants_extra:
+            gathered["extra_logits"] = broadcasted["extra_logits"].cpu()
+        return BatchedDataDict.from_batches([gathered])
 
     @torch.no_grad()
     @wrap_with_nvtx_name("megatron_policy_worker/prepare_refit_info")

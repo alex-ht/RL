@@ -1,0 +1,183 @@
+# Gemma-4 26B-A4B on-policy distillation from 4 resident teachers.
+#
+# 8 nodes x 8 H100:
+#   student train  4 nodes x 8 GPUs = 32 GPUs, expert parallel 32
+#   vLLM generation 2 nodes x 8 GPUs
+#   4 teachers x (1 node x 4 GPUs) = 16 GPUs = 2 nodes, expert parallel 4
+#     STRICT_PACK keeps each teacher's 4 GPUs on one node.
+#     cluster.segment_size stays null: partial-node teachers cannot be
+#     topology-pinned.
+#
+# Replace each teachers.<alias>.model_name with that domain's RL checkpoint.
+# The four task_names below are the dataset task names those stand-in math
+# sets actually emit. Point task_names at your domain mixture (math / code /
+# qa / writing) and keep one tokenizer shared with the student.
+#
+# Objective: reverse KL on the union of the student top-k and the teacher
+# top-k, renormalized inside that union (log_softmax on the union only).
+# Gemma-4 already applies final logit softcapping (30) inside the forward,
+# so loss_fn.final_logit_softcapping stays null. Setting it to 30 would cap
+# twice.
+#
+# Mismatch correction: this distillation loss has no sampled-token importance
+# ratio, so IcePop is not a DistillationLossConfig field. If a GRPO/DAPO term
+# is mixed in later, keep truncated_importance_sampling_type: icepop on that
+# loss. The DAPO Gemma-4 recipe uses TIS; do not copy that onto this loss.
+defaults: ../../distillation_math.yaml
+
+distillation:
+  topk_logits_k: 64
+
+loss_fn:
+  kl_type: reverse
+  mixed_kl_weight: 0.5
+  zero_outside_topk: false
+  topk_mode: union
+  final_logit_softcapping: null
+
+# Drop the colocated single teacher. Resident teachers are `teachers` below.
+teacher: null
+
+teachers:
+  math:
+    # Replace with the math-domain RL expert checkpoint.
+    model_name: google/gemma-4-26B-A4B-it
+    task_names:
+      - DAPOMath17K
+    resources:
+      num_nodes: 1
+      gpus_per_node: 4
+    automodel_cfg:
+      enabled: true
+      expert_parallel_size: 4
+      tensor_parallel_size: 1
+      context_parallel_size: 1
+      activation_checkpointing: true
+  instruction:
+    # Replace with the instruction / OpenMath-domain RL expert checkpoint.
+    model_name: google/gemma-4-26B-A4B-it
+    task_names:
+      - OpenMathInstruct-2
+    resources:
+      num_nodes: 1
+      gpus_per_node: 4
+    automodel_cfg:
+      enabled: true
+      expert_parallel_size: 4
+      tensor_parallel_size: 1
+      context_parallel_size: 1
+      activation_checkpointing: true
+  numina:
+    # Replace with the Numina-domain RL expert checkpoint.
+    model_name: google/gemma-4-26B-A4B-it
+    task_names:
+      - NuminaMath-1.5
+    resources:
+      num_nodes: 1
+      gpus_per_node: 4
+    automodel_cfg:
+      enabled: true
+      expert_parallel_size: 4
+      tensor_parallel_size: 1
+      context_parallel_size: 1
+      activation_checkpointing: true
+  deepscaler:
+    # Replace with the DeepScaler-domain RL expert checkpoint.
+    model_name: google/gemma-4-26B-A4B-it
+    task_names:
+      - DeepScaler
+    resources:
+      num_nodes: 1
+      gpus_per_node: 4
+    automodel_cfg:
+      enabled: true
+      expert_parallel_size: 4
+      tensor_parallel_size: 1
+      context_parallel_size: 1
+      activation_checkpointing: true
+
+policy:
+  model_name: google/gemma-4-26B-A4B-it
+  train_micro_batch_size: 1
+  logprob_batch_size: 1
+  max_total_sequence_length: 6144
+  logprob_chunk_size: 4096
+  make_sequence_length_divisible_by: 64
+  sequence_packing:
+    enabled: false
+  dynamic_batching:
+    enabled: true
+  automodel_cfg:
+    enabled: true
+    expert_parallel_size: 32
+    tensor_parallel_size: 1
+    context_parallel_size: 1
+    activation_checkpointing: true
+    automodel_kwargs:
+      backend:
+        _target_: nemo_automodel.components.models.common.utils.BackendConfig
+        attn: te
+        linear: te
+        rms_norm: te
+        experts: gmm
+        dispatcher: hybridep
+        fake_balanced_gate: false
+        rope_fusion: false
+        enable_hf_state_dict_adapter: true
+      freeze_config:
+        freeze_vision_tower: true
+        freeze_audio_tower: true
+        freeze_language_model: false
+  generation:
+    max_new_tokens: 4096
+    colocated:
+      enabled: false
+      resources:
+        gpus_per_node: 8
+        num_nodes: 2
+    vllm_cfg:
+      tensor_parallel_size: 4
+    vllm_kwargs:
+      language_model_only: true
+
+data:
+  _override_: true
+  max_input_seq_length: ${policy.max_total_sequence_length}
+  shuffle: true
+  train:
+    - dataset_name: DAPOMath17K
+    - dataset_name: OpenMathInstruct-2
+    - dataset_name: NuminaMath-1.5
+    - dataset_name: DeepScaler
+  validation:
+    dataset_name: AIME2024
+    repeat: 16
+  default:
+    prompt_file: examples/prompts/cot.txt
+    system_prompt_file: null
+    env_name: math
+
+env:
+  math:
+    num_workers: 16
+
+checkpointing:
+  checkpoint_dir: results/distillation-gemma4-26ba4b-it-8n8g-automodel-ep32-multiteacher
+
+logger:
+  wandb_enabled: true
+  wandb:
+    project: nemorl-gemma4
+    name: distillation-gemma4-26ba4b-it-8n8g-multiteacher
+  swanlab:
+    project: nemo-distillation
+    name: distillation-gemma4-26ba4b-it-8n8g-multiteacher
+  tensorboard:
+    # Parent interpolates a single data.train.dataset_name. This recipe's
+    # train split is a list, so the log dir is a literal.
+    log_dir: tb_logs-distillation-gemma4-26ba4b-multiteacher
+
+cluster:
+  gpus_per_node: 8
+  num_nodes: 8
+  segment_size: null

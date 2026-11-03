@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 from abc import ABC, abstractmethod
-from typing import Any, Optional, TypedDict
+from typing import Any, NotRequired, Optional, TypedDict
 
 import ray
 import torch
@@ -42,10 +42,15 @@ class ScoreOutputSpec(TypedDict):
 
 
 class TopkLogitsOutputSpec(TypedDict):
-    """Per-position top-k logits and corresponding global token indices."""
+    """Per-position top-k logits and corresponding global token indices.
+
+    ``extra_logits`` is present when the batch carried ``extra_indices``: logits
+    at those global token ids, same rank as ``topk_logits``.
+    """
 
     topk_logits: torch.Tensor
     topk_indices: torch.Tensor
+    extra_logits: NotRequired[torch.Tensor]
 
 
 class TeacherFullPayloadOutputSpec(TypedDict):

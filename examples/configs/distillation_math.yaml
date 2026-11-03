@@ -17,6 +17,12 @@ loss_fn:
     kl_type: "mixed" # forward, reverse, mixed
     mixed_kl_weight: 0.5 # when kl_type is "mixed", this is the weight of the forward KL
     zero_outside_topk: false # zero out the teacher logits outside the top k when calculate forward KL loss
+    # teacher: KL on the teacher top-k (historical). union: reverse KL on the
+    # student top-k ∪ teacher top-k, renormalized inside that union.
+    topk_mode: "teacher" # teacher | union
+    # Gemma-4's forward already applies softcap 30. Set 30 only when the
+    # backend returns raw LM-head logits; setting it again caps twice.
+    final_logit_softcapping: null
 
 checkpointing:
     enabled: true
@@ -261,6 +267,10 @@ policy: &POLICY_BASE
                 gpus_per_node: null # Decides num gpus to be dedicated to generation when there is one node in the cluster i.e cluster.num_nodes == 1
                 num_nodes: null # Decides number of nodes to be dedicated to generation
 
+
+# null keeps the single `teacher:` block. A map of up to 4 resident teachers
+# replaces it; see the Gemma-4 multi-teacher recipe.
+teachers: null
 
 teacher:
     <<: *POLICY_BASE

@@ -11,20 +11,32 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and limitations.
 # limitations under the License.
+import copy
 import os
+import time
 import warnings
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, fields
-from typing import Any, Optional, TypeVar, cast
+from typing import Any, Optional, TypeVar, Union, cast
 
 import numpy as np
 import ray
 import torch
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, model_validator
 from torchdata.stateful_dataloader import StatefulDataLoader
 from transformers import AutoConfig, AutoTokenizer
 from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 
+from nemo_rl.algorithms.distillation_topk import (
+    GEMMA4_FINAL_LOGIT_SOFTCAP,
+    build_union_support,
+    group_row_indices_by_task,
+    merge_rows_in_order,
+    resident_teacher_node_count,
+    schedule_teacher_topk,
+    should_offload_student_for_teacher,
+    validate_teacher_task_routing,
+)
 from nemo_rl.algorithms.grpo import aggregate_rollout_metrics, refit_policy_generation
 from nemo_rl.algorithms.loss import (
     DistillationLossConfig,
@@ -161,11 +173,63 @@ def _get_distillation_save_state(
     return DistillationSaveState(**state_values)
 
 
+class DistillationTeacherResources(BaseModel, extra="forbid"):
+    """GPUs reserved for one resident teacher."""
+
+    num_nodes: int
+    gpus_per_node: int
+
+    @model_validator(mode="after")
+    def _positive(self) -> "DistillationTeacherResources":
+        if self.num_nodes <= 0 or self.gpus_per_node <= 0:
+            raise ValueError(
+                "Teacher resources must be positive, got "
+                f"num_nodes={self.num_nodes}, gpus_per_node={self.gpus_per_node}."
+            )
+        return self
+
+
+class DistillationTeacherAutomodelConfig(BaseModel, extra="allow"):
+    """Automodel overrides applied on top of the student policy.
+
+    Only keys the user set are copied onto the student ``automodel_cfg``.
+    ``enabled`` is forced on when the teacher policy is built.
+    """
+
+    enabled: bool = True
+    expert_parallel_size: Optional[int] = None
+    tensor_parallel_size: Optional[int] = None
+    context_parallel_size: Optional[int] = None
+    activation_checkpointing: Optional[bool] = None
+
+
+class DistillationTeacherConfig(BaseModel, extra="allow"):
+    """One resident teacher: model, Automodel overrides, GPUs, and tasks.
+
+    Samples are routed by ``DatumSpec.task_name``. ``model_name`` replaces the
+    student checkpoint. The student tokenizer is kept, so every teacher must
+    share it.
+    """
+
+    model_name: str
+    task_names: list[str]
+    resources: DistillationTeacherResources
+    automodel_cfg: DistillationTeacherAutomodelConfig = Field(
+        default_factory=DistillationTeacherAutomodelConfig
+    )
+
+
 class MasterConfig(BaseModel, extra="allow"):
-    """Main configuration structure."""
+    """Main configuration structure.
+
+    ``teacher`` is the legacy single teacher colocated on the training cluster.
+    ``teachers`` is a map of up to four resident teachers, each on its own
+    cluster. Exactly one of the two is set.
+    """
 
     policy: PolicyConfig  # Student model configuration
-    teacher: PolicyConfig  # Teacher model configuration
+    teacher: Optional[PolicyConfig] = None
+    teachers: Optional[dict[str, DistillationTeacherConfig]] = None
     loss_fn: DistillationLossConfig  # Loss function configuration
     env: dict[str, Any]  # Environment configuration
     data: DataConfig  # Data configuration
@@ -174,6 +238,22 @@ class MasterConfig(BaseModel, extra="allow"):
     cluster: ClusterConfig  # Cluster configuration
     checkpointing: CheckpointingConfig  # Checkpointing configuration
     telemetry: Optional[TelemetryConfig] = None
+
+    @model_validator(mode="after")
+    def _one_teacher_source(self) -> "MasterConfig":
+        has_teacher = self.teacher is not None
+        has_teachers = self.teachers is not None
+        if has_teacher == has_teachers:
+            raise ValueError(
+                "Set exactly one of `teacher` (one teacher on the training "
+                "cluster) or `teachers` (up to 4 resident teachers on their "
+                "own clusters)."
+            )
+        if self.teachers is not None:
+            validate_teacher_task_routing(
+                {alias: spec.task_names for alias, spec in self.teachers.items()}
+            )
+        return self
 
 
 # ===============================================================================
@@ -207,6 +287,250 @@ def check_vocab_equality(
     )
 
 
+def build_teacher_policy_config(
+    student_policy_config: dict[str, Any], spec: DistillationTeacherConfig
+) -> dict[str, Any]:
+    """Copy the student policy and point it at one resident teacher.
+
+    The tokenizer block is left unchanged so teacher forwards use the student
+    tokenizer. Automodel stays enabled. A Megatron-enabled student is rejected:
+    resident teachers are the Automodel/DTensor path.
+
+    Args:
+        student_policy_config: Resolved student ``PolicyConfig``.
+        spec: One entry from ``teachers``.
+
+    Returns:
+        A policy config suitable for ``Policy(..., init_optimizer=False)``.
+    """
+    cfg = copy.deepcopy(student_policy_config)
+    cfg.pop("pretrained_checkpoint", None)
+    cfg["model_name"] = spec.model_name
+    megatron_cfg = cfg.get("megatron_cfg") or {}
+    if megatron_cfg.get("enabled"):
+        raise ValueError(
+            "Resident teachers use the Automodel/DTensor backend. Disable "
+            "policy.megatron_cfg.enabled or use the single `teacher:` path."
+        )
+    automodel = dict(cfg.get("automodel_cfg") or {})
+    overrides = spec.automodel_cfg.model_dump(exclude_unset=True)
+    automodel.update(
+        {key: value for key, value in overrides.items() if value is not None}
+    )
+    automodel["enabled"] = True
+    cfg["automodel_cfg"] = automodel
+    return cfg
+
+
+def _sequence_packing_enabled(policy_config: dict[str, Any]) -> bool:
+    packing = policy_config.get("sequence_packing") or {}
+    return bool(packing.get("enabled", False))
+
+
+def _context_parallel_size(policy_config: dict[str, Any]) -> int:
+    automodel = policy_config.get("automodel_cfg") or {}
+    if automodel.get("enabled", False):
+        return int(automodel.get("context_parallel_size") or 1)
+    megatron = policy_config.get("megatron_cfg") or {}
+    if megatron.get("enabled", False):
+        return int(megatron.get("context_parallel_size") or 1)
+    return 1
+
+
+def _assert_union_topk_layout(policy_config: dict[str, Any], who: str) -> None:
+    """Union top-k gathers extra indices and does not support CP or packing."""
+    if _sequence_packing_enabled(policy_config):
+        raise ValueError(
+            f"loss_fn.topk_mode='union' does not support sequence packing ({who})."
+        )
+    context_parallel_size = _context_parallel_size(policy_config)
+    if context_parallel_size != 1:
+        raise ValueError(
+            "loss_fn.topk_mode='union' does not support context parallelism "
+            f"({who} context_parallel_size={context_parallel_size})."
+        )
+
+
+def _validate_resident_teacher_placement(
+    alias: str,
+    spec: DistillationTeacherConfig,
+    *,
+    cluster_gpus_per_node: int,
+    segment_size: Optional[int],
+) -> None:
+    """Reject layouts that cannot be pinned to whole nodes."""
+    gpus_per_node = spec.resources.gpus_per_node
+    num_nodes = spec.resources.num_nodes
+    if gpus_per_node > cluster_gpus_per_node:
+        raise ValueError(
+            f"Teacher {alias!r} requests {gpus_per_node} GPUs/node, but the "
+            f"cluster has {cluster_gpus_per_node}."
+        )
+    partial_node = gpus_per_node != cluster_gpus_per_node
+    if num_nodes != 1 and partial_node:
+        raise ValueError(
+            f"Teacher {alias!r} spans {num_nodes} nodes with {gpus_per_node} "
+            f"GPUs/node. Multi-node teachers must take the full node "
+            f"({cluster_gpus_per_node} GPUs)."
+        )
+    if segment_size is not None and partial_node:
+        raise ValueError(
+            "cluster.segment_size cannot be combined with partial-node resident "
+            f"teachers ({alias!r} uses {gpus_per_node} GPUs/node). Set "
+            "cluster.segment_size to null, or give each teacher whole nodes."
+        )
+
+
+def _reserve_teacher_cluster(
+    alias: str,
+    spec: DistillationTeacherConfig,
+    cluster_config: ClusterConfig,
+) -> RayVirtualCluster:
+    """Reserve one teacher's placement group.
+
+    A teacher that fits on one node uses a single STRICT_PACK group so expert
+    parallelism is not spread across nodes. Callers must already have reserved
+    the training and vLLM groups, so these groups land on the leftover GPUs.
+    """
+    fits_one_node = spec.resources.num_nodes == 1
+    teacher_cluster = RayVirtualCluster(
+        name=f"distillation_teacher_{alias}",
+        bundle_ct_per_node_list=[spec.resources.gpus_per_node]
+        * spec.resources.num_nodes,
+        use_gpus=True,
+        num_gpus_per_node=spec.resources.gpus_per_node,
+        max_colocated_worker_groups=1,
+        placement_group_strategy="STRICT_PACK" if fits_one_node else "PACK",
+        port_range_low=cluster_config.master_port_range_low,
+        port_range_high=cluster_config.master_port_range_high,
+    )
+    if fits_one_node:
+        teacher_cluster._init_placement_groups(
+            strategy="STRICT_PACK", use_unified_pg=True
+        )
+    else:
+        teacher_cluster.get_placement_groups()
+    print(
+        f"  ✓ Reserved teacher {alias!r}: {spec.resources.num_nodes} node(s) x "
+        f"{spec.resources.gpus_per_node} GPUs"
+        + (" (STRICT_PACK)" if fits_one_node else ""),
+        flush=True,
+    )
+    return teacher_cluster
+
+
+class MultiTeacherPool:
+    """Route a batch to resident teachers and score them concurrently.
+
+    ``resident`` stays true: the pool's prepare/offload hooks are no-ops so
+    teachers loaded at startup are not offloaded between steps. The student
+    optimizer is left in place because the teachers do not share its GPUs.
+    """
+
+    def __init__(
+        self, policies: dict[str, Policy], task_to_alias: dict[str, str]
+    ) -> None:
+        self.policies = policies
+        self.task_to_alias = task_to_alias
+        self.resident = True
+        self.aliases = list(policies)
+        self.alias_to_id = {alias: index for index, alias in enumerate(self.aliases)}
+        self.last_teacher_seconds: dict[str, float] = {}
+
+    def prepare_for_lp_inference(self) -> None:
+        """No-op. Resident teachers are put in inference mode once at setup."""
+        return None
+
+    def offload_after_refit(self) -> None:
+        """No-op. Resident teachers stay on their GPUs for the run."""
+        return None
+
+    def get_topk_logits(
+        self,
+        data: BatchedDataDict[Any],
+        k: int,
+        micro_batch_size: Optional[int] = None,
+        timer: Optional[Timer] = None,
+    ) -> dict[str, torch.Tensor]:
+        """Score every routed row and merge results back to batch order.
+
+        Args:
+            data: Training batch plus ``task_name`` and, in union mode,
+                ``extra_indices``. ``task_name`` is stripped before the
+                teacher workers see the batch.
+            k: Top-k width.
+            micro_batch_size: Unused. Teachers use their logprob batch size.
+                Accepted so the call matches ``Policy.get_topk_logits``.
+            timer: Optional step timer forwarded to each submit.
+
+        Returns:
+            ``topk_logits``, ``topk_indices``, ``teacher_ids``, and
+            ``extra_logits`` when the batch carried ``extra_indices``.
+        """
+        del micro_batch_size
+        if "task_name" not in data:
+            raise ValueError(
+                "Multi-teacher distillation requires task_name on the teacher batch."
+            )
+        task_names = list(data["task_name"])
+        payload = BatchedDataDict(
+            {key: value for key, value in data.items() if key != "task_name"}
+        )
+        grouped = group_row_indices_by_task(task_names, self.task_to_alias)
+        outputs, elapsed = schedule_teacher_topk(
+            self.policies,
+            grouped,
+            lambda batch, indices: batch.select_indices(indices),
+            payload,
+            k,
+            timer=timer,
+        )
+        self.last_teacher_seconds = elapsed
+        tensors_by_alias: dict[str, dict[str, torch.Tensor]] = {}
+        expected_extra = "extra_indices" in payload
+        for alias, output in outputs.items():
+            tensors = {
+                "topk_logits": output["topk_logits"],
+                "topk_indices": output["topk_indices"],
+            }
+            has_extra = "extra_logits" in output and output["extra_logits"] is not None
+            if expected_extra and not has_extra:
+                raise RuntimeError(
+                    f"Teacher {alias!r} did not return extra_logits for the "
+                    "student top-k indices."
+                )
+            if has_extra:
+                tensors["extra_logits"] = output["extra_logits"]
+            tensors_by_alias[alias] = tensors
+        return merge_rows_in_order(
+            len(task_names),
+            grouped,
+            tensors_by_alias,
+            alias_to_id=self.alias_to_id,
+        )
+
+
+def _reduce_distillation_teacher_metrics(
+    metrics: dict[str, Any],
+    loss_fn: DistillationLossFn,
+    teacher_seconds: dict[str, float],
+) -> None:
+    """Turn summed microbatch KL stats into per-teacher means.
+
+    The train loop sums ``all_mb_metrics`` across microbatches. Sum/count
+    pairs survive that reduction; the ratios are formed here, after the sum.
+    """
+    for alias in loss_fn.teacher_aliases:
+        count = metrics.get(f"teacher_kl_count/{alias}", 0)
+        if count:
+            metrics[f"kl/{alias}"] = metrics[f"teacher_kl_sum/{alias}"] / count
+    union_count = metrics.get("union_size_count", 0)
+    if union_count:
+        metrics["union_size"] = metrics["union_size_sum"] / union_count
+    for alias, elapsed in teacher_seconds.items():
+        metrics[f"teacher_time/{alias}"] = float(elapsed)
+
+
 def setup(
     master_config: MasterConfig,
     tokenizer: TokenizerType,
@@ -214,7 +538,7 @@ def setup(
     val_dataset: Optional[AllTaskProcessedDataset],
 ) -> tuple[
     ColocatablePolicyInterface,  # student_policy
-    ColocatablePolicyInterface,  # teacher_policy
+    Union[ColocatablePolicyInterface, MultiTeacherPool],  # teacher_policy
     Optional[GenerationInterface],  # student_generation
     Optional[EnvironmentInterface],  # nemo_gym
     StatefulDataLoader,
@@ -235,7 +559,7 @@ def setup(
     # Extract configuration
     policy_config = master_config.policy
     generation_config = policy_config["generation"]
-    teacher_config = master_config.teacher
+    teacher_specs = getattr(master_config, "teachers", None)
     loss_config = master_config.loss_fn
     data_config = master_config.data
     env_configs = getattr(master_config, "env", {}) or {}
@@ -278,8 +602,38 @@ def setup(
         refit_transport=generation_config.get("refit_transport"),
     )
 
+    # Resident teachers are copied from the student before later mutations
+    # (Megatron ``train_iters``, resume paths) and do not load the student
+    # checkpoint. The legacy ``teacher:`` block is already a full policy config.
+    teacher_policy_configs: Optional[dict[str, dict[str, Any]]] = None
+    if teacher_specs is not None:
+        student_template = copy.deepcopy(policy_config)
+        student_template.pop("pretrained_checkpoint", None)
+        teacher_policy_configs = {
+            alias: build_teacher_policy_config(student_template, spec)
+            for alias, spec in teacher_specs.items()
+        }
+        checked_policies: list[tuple[str, dict[str, Any]]] = [
+            ("student", policy_config),
+            *[
+                (f"teacher:{alias}", cfg)
+                for alias, cfg in teacher_policy_configs.items()
+            ],
+        ]
+    else:
+        teacher_config = master_config.teacher
+        if teacher_config is None:
+            raise ValueError(
+                "Distillation requires `teacher` or `teachers` in the config."
+            )
+        checked_policies = [("student", policy_config), ("teacher", teacher_config)]
+
+    if loss_config.topk_mode == "union":
+        for who, cfg in checked_policies:
+            _assert_union_topk_layout(cfg, who)
+
     # Disallow SP + packing for dtensor path
-    for cfg, who in ((policy_config, "student"), (teacher_config, "teacher")):
+    for who, cfg in checked_policies:
         # DTensor sequence parallel is supported; ensure CP and SP are not enabled together
         # This incompatibility is enforced in DTensor workers during initialization.
         # Additionally, SP may not be compatible with sequence packing for some models.
@@ -363,9 +717,35 @@ def setup(
     enable_nemo_gym = bool(env_configs) and should_use_nemo_gym(master_config)
     nemo_gym_actor: Optional[EnvironmentInterface] = None
     segment_size = cluster_config.segment_size
+    teacher_nodes = 0
+    if teacher_specs is not None:
+        for alias, spec in teacher_specs.items():
+            _validate_resident_teacher_placement(
+                alias,
+                spec,
+                cluster_gpus_per_node=cluster_config.gpus_per_node,
+                segment_size=segment_size,
+            )
+        teacher_nodes = resident_teacher_node_count(
+            [
+                spec.resources.num_nodes * spec.resources.gpus_per_node
+                for spec in teacher_specs.values()
+            ],
+            cluster_config.gpus_per_node,
+        )
+        print(
+            f"  ✓ Resident teachers reserve {teacher_nodes} cluster node(s)",
+            flush=True,
+        )
 
     if colocated_inference:
-        num_nodes = cluster_config.num_nodes
+        num_nodes = cluster_config.num_nodes - teacher_nodes
+        if num_nodes <= 0:
+            raise ValueError(
+                "No nodes left for the student after reserving "
+                f"{teacher_nodes} node(s) for resident teachers "
+                f"(cluster.num_nodes={cluster_config.num_nodes})."
+            )
         node_resource_constraints, _, _ = prepare_segment_topology(
             segment_size, num_nodes
         )
@@ -434,6 +814,15 @@ def setup(
             )
             train_nodes -= inference_nodes
 
+        train_nodes -= teacher_nodes
+        if train_nodes <= 0:
+            raise ValueError(
+                "No nodes left for the student after reserving "
+                f"{inference_nodes} inference node(s) and {teacher_nodes} "
+                f"resident-teacher node(s) "
+                f"(cluster.num_nodes={cluster_config.num_nodes})."
+            )
+
         # Topology-aware node selection for non-colocated distillation
         node_resource_constraints = None
         inference_node_resource_constraints = None
@@ -490,31 +879,75 @@ def setup(
     # Checkpoint paths
     weights_path = None
     optimizer_path = None
-
-    if not bool(os.getenv("NRL_SKIP_DISTILLATION_TOKENIZER_CHECK", False)):
-        check_vocab_equality(
-            tokenizer, policy_config["model_name"], teacher_config["model_name"]
-        )
-
-    if "megatron_cfg" in teacher_config and teacher_config["megatron_cfg"]["enabled"]:
-        ## NOTE: this is equal to the total number of scheduler steps
-        total_train_iters = min(
-            distillation_config.max_num_steps,
-            distillation_config.max_num_epochs * len(dataloader),
-        )
-        teacher_config["megatron_cfg"]["train_iters"] = total_train_iters
-
-    teacher_policy = Policy(
-        name_prefix="teacher",
-        cluster=train_cluster,
-        config=teacher_config,
-        tokenizer=tokenizer,
-        weights_path=weights_path,
-        optimizer_path=optimizer_path,
-        init_optimizer=False,
-        init_reference_model=False,
+    skip_tokenizer_check = bool(
+        os.getenv("NRL_SKIP_DISTILLATION_TOKENIZER_CHECK", False)
     )
-    teacher_policy.offload_after_refit()
+
+    if teacher_policy_configs is not None:
+        assert teacher_specs is not None
+        # Claim train, then vLLM, then teachers so partial-GPU STRICT_PACK
+        # groups land on the nodes those budgets left behind.
+        train_cluster.get_placement_groups()
+        if inference_cluster is not train_cluster:
+            inference_cluster.get_placement_groups()
+        teacher_clusters = {
+            alias: _reserve_teacher_cluster(alias, spec, cluster_config)
+            for alias, spec in teacher_specs.items()
+        }
+        policies: dict[str, Policy] = {}
+        for alias, cfg in teacher_policy_configs.items():
+            if not skip_tokenizer_check:
+                check_vocab_equality(
+                    tokenizer, policy_config["model_name"], cfg["model_name"]
+                )
+            policies[alias] = Policy(
+                name_prefix=f"teacher_{alias}",
+                cluster=teacher_clusters[alias],
+                config=cfg,
+                tokenizer=tokenizer,
+                weights_path=weights_path,
+                optimizer_path=optimizer_path,
+                init_optimizer=False,
+                init_reference_model=False,
+            )
+            # Stay resident. Do not offload_after_refit between steps.
+            policies[alias].prepare_for_lp_inference()
+        teacher_policy: Union[ColocatablePolicyInterface, MultiTeacherPool] = (
+            MultiTeacherPool(
+                policies,
+                validate_teacher_task_routing(
+                    {alias: spec.task_names for alias, spec in teacher_specs.items()}
+                ),
+            )
+        )
+    else:
+        if not skip_tokenizer_check:
+            check_vocab_equality(
+                tokenizer, policy_config["model_name"], teacher_config["model_name"]
+            )
+
+        if (
+            "megatron_cfg" in teacher_config
+            and teacher_config["megatron_cfg"]["enabled"]
+        ):
+            ## NOTE: this is equal to the total number of scheduler steps
+            total_train_iters = min(
+                distillation_config.max_num_steps,
+                distillation_config.max_num_epochs * len(dataloader),
+            )
+            teacher_config["megatron_cfg"]["train_iters"] = total_train_iters
+
+        teacher_policy = Policy(
+            name_prefix="teacher",
+            cluster=train_cluster,
+            config=teacher_config,
+            tokenizer=tokenizer,
+            weights_path=weights_path,
+            optimizer_path=optimizer_path,
+            init_optimizer=False,
+            init_reference_model=False,
+        )
+        teacher_policy.offload_after_refit()
 
     # ==========================
     #    Student Generation Interface
@@ -662,6 +1095,23 @@ def setup(
         ray.get(futures_train + futures_inference)
 
     loss_fn = DistillationLossFn(loss_config)
+    if isinstance(teacher_policy, MultiTeacherPool):
+        loss_fn.teacher_aliases = list(teacher_policy.aliases)
+    else:
+        # Legacy single teacher. Per-teacher KL is recorded only when the
+        # batch carries teacher_ids, which this path does not set.
+        loss_fn.teacher_aliases = ["teacher"]
+
+    if (
+        "gemma-4" in str(policy_config["model_name"]).lower()
+        and loss_config.final_logit_softcapping is None
+    ):
+        print(
+            "  ✓ Gemma-4 student: the model forward already applies final logit "
+            f"softcapping ({GEMMA4_FINAL_LOGIT_SOFTCAP:g}). "
+            "loss_fn.final_logit_softcapping is unset, so it is not applied twice.",
+            flush=True,
+        )
 
     print("\n" + "=" * 60)
     print(" " * 18 + "SETUP COMPLETE")
@@ -689,7 +1139,7 @@ def setup(
 
 def _distillation_train_impl(
     student_policy: ColocatablePolicyInterface,
-    teacher_policy: ColocatablePolicyInterface,
+    teacher_policy: Union[ColocatablePolicyInterface, MultiTeacherPool],
     student_generation: Optional[GenerationInterface],
     dataloader: StatefulDataLoader,
     val_dataloader: Optional[StatefulDataLoader],
@@ -930,17 +1380,52 @@ def _distillation_train_impl(
                     )
                     train_data.to("cpu")
 
+                resident_teachers = isinstance(teacher_policy, MultiTeacherPool)
+                offload_student = should_offload_student_for_teacher(
+                    resident_teachers=resident_teachers,
+                    colocated_inference=colocated_inference,
+                )
+                topk_k = master_config.distillation.topk_logits_k
+                student_indices = None
+                if loss_fn.topk_mode == "union":
+                    # Student top-k must finish before the teachers run: they
+                    # score the union, so they need these indices. Teachers
+                    # then overlap each other, not this student pass.
+                    print("▶ Computing student top-k for the union...", flush=True)
+                    if offload_student:
+                        # Free the optimizer, keep the weights, then score.
+                        student_policy.offload_before_refit()
+                    student_policy.prepare_for_lp_inference()
+                    with timer.time("student_topk_for_union"):
+                        student_topk = student_policy.get_topk_logits(
+                            train_data, k=topk_k, timer=timer
+                        )
+                    student_indices = student_topk["topk_indices"]
+
                 print("▶ Preparing for teacher logprob inference...", flush=True)
                 with timer.time("teacher_logprob_inference_prep"):
-                    if not colocated_inference:
+                    if offload_student and loss_fn.topk_mode != "union":
                         # Unless policy offload was requested for refit, optimizer
                         # state may still be on the train GPUs from the previous
                         # step. Offload it so the teacher fits for top-k inference;
-                        # prepare_for_training() below reloads it.
+                        # prepare_for_training() below reloads it. Union mode
+                        # already offloaded above, before the student top-k.
                         student_policy.offload_before_refit()
                     teacher_policy.prepare_for_lp_inference()
 
                 print("▶ Computing teacher logprobs...", flush=True)
+                teacher_batch = BatchedDataDict[Any](
+                    {key: value for key, value in train_data.items()}
+                )
+                if resident_teachers:
+                    if "task_name" not in repeated_batch:
+                        raise ValueError(
+                            "Multi-teacher distillation requires task_name on "
+                            "each sample."
+                        )
+                    teacher_batch["task_name"] = repeated_batch["task_name"]
+                if student_indices is not None:
+                    teacher_batch["extra_indices"] = student_indices
                 with (
                     timer.time("teacher_logprob_inference"),
                     managed_span(
@@ -949,17 +1434,42 @@ def _distillation_train_impl(
                         tracer=_tracer,
                     ),
                 ):
+                    teacher_started = time.perf_counter()
                     teacher_topk = teacher_policy.get_topk_logits(
-                        train_data,
-                        k=master_config.distillation.topk_logits_k,
+                        teacher_batch,
+                        k=topk_k,
                         timer=timer,
                     )
-                    train_data["teacher_topk_logits"] = teacher_topk["topk_logits"]
-                    train_data["teacher_topk_indices"] = teacher_topk["topk_indices"]
+                    legacy_teacher_seconds = time.perf_counter() - teacher_started
+                    if loss_fn.topk_mode == "union":
+                        if "extra_logits" not in teacher_topk:
+                            raise RuntimeError(
+                                "Union top-k requires teacher logits at the "
+                                "student top-k indices (extra_logits)."
+                            )
+                        union_indices, union_mask, teacher_union_logits = (
+                            build_union_support(
+                                student_indices,
+                                teacher_topk["topk_indices"],
+                                teacher_topk["topk_logits"],
+                                teacher_topk["extra_logits"],
+                            )
+                        )
+                        train_data["teacher_topk_logits"] = teacher_union_logits
+                        train_data["teacher_topk_indices"] = union_indices
+                        train_data["union_mask"] = union_mask
+                    else:
+                        train_data["teacher_topk_logits"] = teacher_topk["topk_logits"]
+                        train_data["teacher_topk_indices"] = teacher_topk[
+                            "topk_indices"
+                        ]
+                    if "teacher_ids" in teacher_topk:
+                        train_data["teacher_ids"] = teacher_topk["teacher_ids"]
 
                 print("▶ Preparing for training...", flush=True)
                 with timer.time("training_prep"):
-                    teacher_policy.offload_after_refit()
+                    if not resident_teachers:
+                        teacher_policy.offload_after_refit()
                     student_policy.prepare_for_training()  # set model train and reload optim to GPU
                     POLICY_GENERATION_STALE = True
 
@@ -1030,6 +1540,11 @@ def _distillation_train_impl(
                         metrics[k] = np.mean(v).item()
                     else:
                         metrics[k] = np.sum(v).item()
+                if resident_teachers:
+                    teacher_seconds = teacher_policy.last_teacher_seconds
+                else:
+                    teacher_seconds = {"teacher": legacy_teacher_seconds}
+                _reduce_distillation_teacher_metrics(metrics, loss_fn, teacher_seconds)
                 metrics.update(rollout_metrics)
                 total_valid_tokens += metrics["global_valid_toks"]
 
@@ -1143,6 +1658,13 @@ def _distillation_train_impl(
             print("\n📊 Training Results:")
 
             print(f"  • Loss: {metrics['loss']:.4f}")
+            if "union_size" in metrics:
+                print(f"  • Union size: {metrics['union_size']:.2f}")
+            for metric_name, metric_value in metrics.items():
+                if metric_name.startswith("kl/"):
+                    print(
+                        f"  • KL ({metric_name.split('/', 1)[1]}): {float(metric_value):.4f}"
+                    )
             print(
                 f"  • Mean Generation Length: {rollout_metrics['mean_gen_tokens_per_sample']:.4f}"
             )
@@ -1231,7 +1753,7 @@ def _distillation_train_impl(
 @umbrella_trace_fn(RLSpanGroup.U_JOB, "rl.distillation.job")
 def distillation_train(
     student_policy: ColocatablePolicyInterface,
-    teacher_policy: ColocatablePolicyInterface,
+    teacher_policy: Union[ColocatablePolicyInterface, MultiTeacherPool],
     student_generation: Optional[GenerationInterface],
     dataloader: StatefulDataLoader,
     val_dataloader: Optional[StatefulDataLoader],

@@ -315,6 +315,8 @@ def prepare_loss_input(
                 vocab_parallel_group=vocab_parallel_group,
                 context_parallel_group=context_parallel_group,
                 cp_sharder=cp_sharder,
+                index_mask=data["union_mask"] if "union_mask" in data else None,
+                logit_softcap=getattr(loss_fn, "final_logit_softcapping", None),
             )
         )
 
