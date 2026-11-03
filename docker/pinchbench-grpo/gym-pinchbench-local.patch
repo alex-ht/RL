@@ -1,0 +1,738 @@
+diff --git a/responses_api_agents/pinchbench/app.py b/responses_api_agents/pinchbench/app.py
+index 658b7a33..64e03385 100644
+--- a/responses_api_agents/pinchbench/app.py
++++ b/responses_api_agents/pinchbench/app.py
+@@ -21,7 +21,9 @@ import asyncio
+ import glob
+ import json
+ import logging
++import os
+ import shutil
++import signal
+ import tarfile
+ import textwrap
+ import uuid
+@@ -78,6 +80,13 @@ class PinchBenchAgentConfig(BaseResponsesAPIAgentConfig):
+     judge_base_url: str
+     judge_api_key: str
+     judge_model_server: Optional[ModelServerRef] = None
++    # Fallback judge used when the primary judge fails all retries (skill fork
++    # benchmark.py --judge-fallback). Only forwarded by the local provider.
++    judge_fallback_model: Optional[str] = None
++    # Mask (instance_config.mask_sample=True) instead of scoring 0 when the
++    # grade is not a measurement of the policy (judge/grader failure, reported
++    # by the skill fork as grading.runs[].judge_failed).
++    mask_on_judge_failure: bool = True
+ 
+     openclaw_mode: Literal["gateway"] = "gateway"
+     gateway_token: str = "pinchbench-local"
+@@ -93,6 +102,15 @@ class PinchBenchAgentConfig(BaseResponsesAPIAgentConfig):
+     tavily_api_key: Optional[str] = None
+ 
+     timeout_multiplier: float = 3.0
++    # OpenClaw tools.web.fetch.maxChars (local provider; None keeps default).
++    web_fetch_max_chars: Optional[int] = None
++    # Extra request params merged into the OpenClaw model params (local
++    # provider), e.g. {"temperature": 1.0, "top_p": 0.95, "top_k": 64}.
++    sampling_params: Optional[dict[str, Any]] = None
++    # OpenClaw model "reasoning" flag (local provider).
++    model_reasoning: bool = False
++    # OpenClaw --thinking level (local provider; None = default).
++    thinking_level: Optional[str] = None
+     max_concurrent: int = 4
+     max_tokens: int = 16384
+     context_window: int = 131072
+@@ -139,9 +157,16 @@ class PinchBenchAgentConfig(BaseResponsesAPIAgentConfig):
+                 raise ValueError(
+                     f"sandbox_provider must contain exactly one provider, got: {sorted(self.sandbox_provider)}"
+                 )
+-            get_provider_class(next(iter(self.sandbox_provider)))
++            provider_name = next(iter(self.sandbox_provider))
++            if provider_name != LOCAL_PROVIDER:
++                get_provider_class(provider_name)
+         image = self.sandbox_spec.get("image")
+-        if image and "://" not in str(image) and not Path(str(image)).exists():
++        if (
++            image
++            and LOCAL_PROVIDER not in self.sandbox_provider
++            and "://" not in str(image)
++            and not Path(str(image)).exists()
++        ):
+             raise ValueError(
+                 f"sandbox_spec.image={image!r} does not exist on disk. "
+                 "Verify the cache mount is configured and the image path is correct."
+@@ -151,11 +176,81 @@ class PinchBenchAgentConfig(BaseResponsesAPIAgentConfig):
+ 
+ _AGENT_ID_PREFIX = "bench-"
+ 
++# `sandbox_provider: {local: {...}}`: run each task as a plain subprocess of
++# this server (no per-task container) in a private per-rollout directory. For
++# SLURM + enroot/Pyxis clusters where the Gym server already runs inside the
++# image and no apptainer/docker exists. Options (all optional):
++#   work_root:        dir for per-rollout dirs (default: $PINCHBENCH_GYM_WORK_ROOT,
++#                     $PINCHBENCH_WORKDIR/gym, $SLURM_TMPDIR/pinchbench/gym,
++#                     $SLURM_SUBMIT_DIR/.pinchbench-work/job-$SLURM_JOB_ID/gym). Never /tmp.
++#   run_task_script:  default <this dir>/run_task_local.sh
++#   skill_dir:        PinchBench skill checkout (default $PINCHBENCH_SKILL_DIR or /opt/pinchbench)
++#   python:           interpreter for benchmark.py (default $PINCHBENCH_PYTHON or python3)
++#   inherit_env:      extra env var names to pass through from this server
++#   keep_workdirs:    keep per-rollout dirs for debugging (default false)
++LOCAL_PROVIDER = "local"
++_LOCAL_INHERIT_ENV = (
++    "PATH", "LANG", "LC_ALL", "LC_CTYPE", "TZ", "USER", "LOGNAME", "SHELL",
++    "SSL_CERT_FILE", "SSL_CERT_DIR", "REQUESTS_CA_BUNDLE", "CURL_CA_BUNDLE", "NODE_EXTRA_CA_CERTS",
++    "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "http_proxy", "https_proxy", "no_proxy", "ALL_PROXY",
++    "GWS_SOURCE_CONFIG_DIR", "PLAYWRIGHT_BROWSERS_PATH", "GH_TOKEN", "NODE_OPTIONS", "NODE_PATH",
++    "SLURM_JOB_ID", "SLURM_PROCID", "SLURMD_NODENAME",
++)
++_TMP_PREFIXES = ("/tmp", "/var/tmp")
++
++
++def _is_under_tmp(path: Path) -> bool:
++    resolved = str(path.resolve())
++    return any(resolved == p or resolved.startswith(p + "/") for p in _TMP_PREFIXES)
++
++
++def resolve_local_work_root(explicit: Optional[str] = None) -> Path:
++    """Pick the per-rollout work root for the local provider (never /tmp)."""
++    candidates: list[Path] = []
++    if explicit:
++        candidates.append(Path(explicit).expanduser())
++    for env_name, suffix in (
++        ("PINCHBENCH_GYM_WORK_ROOT", ""),
++        ("PINCHBENCH_WORKDIR", "gym"),
++        ("SLURM_TMPDIR", "pinchbench/gym"),
++    ):
++        value = (os.environ.get(env_name) or "").strip()
++        if value:
++            candidates.append(Path(value) / suffix if suffix else Path(value))
++    job_id = (os.environ.get("SLURM_JOB_ID") or "").strip()
++    if job_id:
++        submit = (os.environ.get("SLURM_SUBMIT_DIR") or os.getcwd()).strip()
++        candidates.append(Path(submit) / ".pinchbench-work" / f"job-{job_id}" / "gym")
++    for cand in candidates:
++        if _is_under_tmp(cand):
++            LOG.warning("pinchbench local work_root candidate under /tmp rejected: %s", cand)
++            continue
++        try:
++            cand.mkdir(parents=True, exist_ok=True)
++        except OSError:
++            continue
++        if os.access(cand, os.W_OK | os.X_OK):
++            return cand.resolve()
++    raise ValueError(
++        "pinchbench local provider: no writable work_root (set sandbox_provider.local.work_root, "
++        "PINCHBENCH_GYM_WORK_ROOT or PINCHBENCH_WORKDIR to a non-/tmp directory)"
++    )
++
+ 
+ class SandboxKilledError(RuntimeError):
+     """Sandbox process died by signal (walltime SIGTERM / preemption / OOM kill)."""
+ 
+ 
++def _kill_process_group(pid: Optional[int]) -> None:
++    """SIGKILL a process group started with start_new_session=True (ignore if gone)."""
++    if not pid:
++        return
++    try:
++        os.killpg(pid, signal.SIGKILL)
++    except (ProcessLookupError, PermissionError):
++        pass
++
++
+ def _classify_task_failure(exc: BaseException) -> str:
+     """Map a task failure onto the dispatcher's routing classes."""
+     if isinstance(exc, SandboxKilledError):
+@@ -190,6 +285,7 @@ class PinchBenchAgent(SimpleResponsesAPIAgent):
+ 
+     def model_post_init(self, context):
+         self._sem = asyncio.Semaphore(self.config.max_concurrent)
++        self._local_root_cache = None
+         return super().model_post_init(context)
+ 
+     async def responses(
+@@ -241,6 +337,16 @@ class PinchBenchAgent(SimpleResponsesAPIAgent):
+             env["BRAVE_API_KEY"] = self.config.brave_api_key
+         if self.config.tavily_api_key:
+             env["TAVILY_API_KEY"] = self.config.tavily_api_key
++        if self.config.judge_fallback_model:
++            env["JUDGE_FALLBACK_MODEL"] = self.config.judge_fallback_model
++        if self.config.web_fetch_max_chars:
++            env["PINCHBENCH_WEB_FETCH_MAX_CHARS"] = str(self.config.web_fetch_max_chars)
++        if self.config.sampling_params:
++            env["PINCHBENCH_SAMPLING_PARAMS"] = json.dumps(self.config.sampling_params)
++        if self.config.model_reasoning:
++            env["PINCHBENCH_MODEL_REASONING"] = "1"
++        if self.config.thinking_level:
++            env["PINCHBENCH_THINKING"] = self.config.thinking_level
+         if rollout_id is not None:
+             env["NEMO_GYM_OBSERVABILITY_ENABLED"] = "1"
+         return env
+@@ -270,6 +376,8 @@ class PinchBenchAgent(SimpleResponsesAPIAgent):
+         still produced an archive (non-clean exit), or None in all other cases.
+         """
+         provider = self.config.sandbox_provider or {}
++        if isinstance(provider, dict) and LOCAL_PROVIDER in provider:
++            return await self._run_local(task_id, out_dir, provider.get(LOCAL_PROVIDER) or {}, rollout_id=rollout_id)
+         apptainer_cfg = provider.get("apptainer") if isinstance(provider, dict) else None
+         if isinstance(apptainer_cfg, dict) and apptainer_cfg.get("direct_exec"):
+             return await self._run_in_apptainer_direct(task_id, out_dir, apptainer_cfg, rollout_id=rollout_id)
+@@ -491,6 +599,109 @@ class PinchBenchAgent(SimpleResponsesAPIAgent):
+             tf.extractall(out_dir)  # noqa: S202 -- trusted, in-sandbox-produced archive
+         return proc.returncode if proc.returncode != 0 else None
+ 
++    def _local_work_root(self, local_cfg: dict[str, Any]) -> Path:
++        cached = self._local_root_cache
++        if cached is None:
++            cached = resolve_local_work_root(local_cfg.get("work_root"))
++            self._local_root_cache = cached
++        return cached
++
++    def _local_run_dir(self, out_dir: Path) -> Path:
++        """Per-rollout run dir for the local provider (out_dir unless it is under /tmp)."""
++        provider = self.config.sandbox_provider or {}
++        local_cfg = provider.get(LOCAL_PROVIDER) or {}
++        if not _is_under_tmp(out_dir):
++            return out_dir
++        return self._local_work_root(local_cfg) / "runs" / out_dir.name
++
++    async def _run_local(
++        self,
++        task_id: str,
++        out_dir: Path,
++        local_cfg: dict[str, Any],
++        rollout_id: Optional[str] = None,
++    ) -> int | None:
++        """Run one task as a local subprocess in a private per-rollout dir.
++
++        Same contract as the apptainer direct-exec path: returns the exit code on a
++        non-clean exit that still produced results, None on a clean exit; raises
++        SandboxKilledError / TimeoutError / RuntimeError otherwise.
++        """
++        work_root = self._local_work_root(local_cfg)
++        base = work_root / "rollouts" / f"{task_id}-{out_dir.name}"
++        if base.exists():
++            shutil.rmtree(base, ignore_errors=True)
++        base.mkdir(parents=True)
++        script = Path(local_cfg.get("run_task_script") or Path(__file__).with_name("run_task_local.sh"))
++        if not script.exists():
++            raise RuntimeError(f"pinchbench local run_task_script not found: {script}")
++
++        env: dict[str, str] = {}
++        for name in (*_LOCAL_INHERIT_ENV, *(local_cfg.get("inherit_env") or [])):
++            value = os.environ.get(name)
++            if value is not None:
++                env[name] = value
++        env.update(self._task_env(task_id, rollout_id))
++        env["PINCHBENCH_WORK_BASE"] = str(base)
++        skill_dir = local_cfg.get("skill_dir") or os.environ.get("PINCHBENCH_SKILL_DIR")
++        if skill_dir:
++            env["PINCHBENCH_SKILL_DIR"] = str(skill_dir)
++        python = local_cfg.get("python") or os.environ.get("PINCHBENCH_PYTHON")
++        if python:
++            env["PINCHBENCH_PYTHON"] = str(python)
++        # The gateway token is meaningless without a gateway; do not leak it around.
++        env.pop("OPENCLAW_GATEWAY_TOKEN", None)
++
++        stdout_path = base / "local.stdout.log"
++        stderr_path = base / "local.stderr.log"
++        results_dir = base / "out"
++        try:
++            with stdout_path.open("wb") as stdout_f, stderr_path.open("wb") as stderr_f:
++                proc = await asyncio.create_subprocess_exec(
++                    "bash",
++                    str(script),
++                    cwd=str(base),
++                    env=env,
++                    stdin=asyncio.subprocess.DEVNULL,
++                    stdout=stdout_f,
++                    stderr=stderr_f,
++                    start_new_session=True,
++                )
++                try:
++                    await asyncio.wait_for(proc.wait(), timeout=self.config.task_timeout_s)
++                except asyncio.TimeoutError as exc:
++                    _kill_process_group(proc.pid)
++                    await proc.wait()
++                    raise TimeoutError(f"local pinchbench run timed out for task {task_id}") from exc
++                finally:
++                    # OpenClaw tool subprocesses can outlive run_task_local.sh; reap the group.
++                    _kill_process_group(proc.pid)
++
++            rc = proc.returncode
++            has_results = any(p for p in results_dir.glob("*.json") if "transcript" not in p.name)
++            if rc != 0 and not has_results:
++                run_log = results_dir / "run.log"
++                tail = ""
++                for path in (run_log, stderr_path, stdout_path):
++                    if path.exists():
++                        tail = path.read_text(errors="replace")[-4000:]
++                        if tail.strip():
++                            break
++                if rc is not None and (rc < 0 or rc in (137, 143)):
++                    raise SandboxKilledError(f"local pinchbench run killed (rc={rc}) for task {task_id}: {tail[:1000]}")
++                raise RuntimeError(f"local pinchbench run failed (rc={rc}) for task {task_id}: {tail}")
++            if rc != 0:
++                print(
++                    f"[pinchbench] non-clean local exit (rc={rc}) for task {task_id} but results present — continuing",
++                    flush=True,
++                )
++            if results_dir.exists():
++                shutil.copytree(results_dir, out_dir, dirs_exist_ok=True, symlinks=True)
++            return rc if rc != 0 else None
++        finally:
++            if not local_cfg.get("keep_workdirs"):
++                shutil.rmtree(base, ignore_errors=True)
++
+     def _parse_result(self, task_id: str, out_dir: Path) -> dict:
+         results = [p for p in glob.glob(str(out_dir / "*.json")) if "transcript" not in p]
+         if not results:
+@@ -504,13 +715,16 @@ class PinchBenchAgent(SimpleResponsesAPIAgent):
+         for t in data.get("tasks", []):
+             if t.get("task_id") == task_id:
+                 g = t.get("grading") or {}
+-                run0 = (g.get("runs") or [{}])[0]
++                runs = g.get("runs") or [{}]
++                run0 = runs[0]
++                judge_failed = any(bool((r or {}).get("judge_failed")) for r in runs)
+                 return {
+                     "reward": float(g.get("mean", 0.0)),
+                     "grading_type": run0.get("grading_type", "unknown"),
+                     "breakdown": run0.get("breakdown", {}),
+                     "notes": run0.get("notes", ""),
+-                    "status": "success",
++                    "status": "judge_failed" if judge_failed else "success",
++                    "judge_failed": judge_failed,
+                 }
+         return {"reward": 0.0, "grading_type": "unknown", "breakdown": {}, "notes": "", "status": "missing_task"}
+ 
+@@ -734,7 +948,11 @@ class PinchBenchAgent(SimpleResponsesAPIAgent):
+         events = self._read_transcript_events(task_id, out_dir)
+         archive = ""
+         if tdir.exists():
+-            dest = Path(self.config.transcripts_dir) / f"{task_id}_{run_id}"
++            transcripts_root = Path(self.config.transcripts_dir)
++            if LOCAL_PROVIDER in (self.config.sandbox_provider or {}) and _is_under_tmp(transcripts_root):
++                local_cfg = (self.config.sandbox_provider or {}).get(LOCAL_PROVIDER) or {}
++                transcripts_root = self._local_work_root(local_cfg) / "transcripts"
++            dest = transcripts_root / f"{task_id}_{run_id}"
+             dest.parent.mkdir(parents=True, exist_ok=True)
+             try:
+                 shutil.copytree(tdir, dest, dirs_exist_ok=True)
+@@ -851,6 +1069,8 @@ class PinchBenchAgent(SimpleResponsesAPIAgent):
+ 
+         run_id = uuid.uuid4().hex
+         out_dir = Path(self.config.work_root) / run_id
++        if LOCAL_PROVIDER in (self.config.sandbox_provider or {}):
++            out_dir = self._local_run_dir(out_dir)
+         out_dir.mkdir(parents=True, exist_ok=True)
+         result = {"reward": 0.0, "grading_type": "unknown", "breakdown": {}, "notes": "", "status": "error"}
+         routing: dict = {}
+@@ -893,6 +1113,15 @@ class PinchBenchAgent(SimpleResponsesAPIAgent):
+                 )
+             shutil.rmtree(out_dir, ignore_errors=True)
+ 
++        if result.get("judge_failed") and self.config.mask_on_judge_failure:
++            # Not a measurement of the policy: keep the sample out of the loss
++            # (NeMo-RL honours instance_config.mask_sample when
++            # env.should_mask_flagged_samples is true).
++            instance_config = dict(record.get("instance_config") or {})
++            instance_config["mask_sample"] = True
++            record["instance_config"] = instance_config
++            print(f"[pinchbench] judge failed for {task_id}: masking sample ({result.get('notes', '')[:200]})", flush=True)
++
+         raw_rollout: dict = {
+             "transcript_event_count": len(transcript_events),
+             "archived_to": archive_path,
+diff --git a/responses_api_agents/pinchbench/run_task_local.sh b/responses_api_agents/pinchbench/run_task_local.sh
+new file mode 100755
+index 00000000..a2c7aa8a
+--- /dev/null
++++ b/responses_api_agents/pinchbench/run_task_local.sh
+@@ -0,0 +1,186 @@
++#!/usr/bin/env bash
++# Local (container-less) PinchBench task runner for the pinchbench agent's
++# `sandbox_provider: {local: {...}}` mode. Used where no per-task container
++# runtime exists (SLURM + enroot/Pyxis: no apptainer, no docker): the Gym
++# agent server, already running INSIDE the training container, launches this
++# script as a plain subprocess per rollout.
++#
++# Isolation boundary = a private per-rollout directory ($PINCHBENCH_WORK_BASE):
++# HOME, OPENCLAW_STATE_DIR, TMPDIR, PINCHBENCH_WORKDIR (benchmark run-root,
++# judge workspaces), caches, fws/gh state all live there, so concurrent
++# rollouts never share OpenClaw state. Nothing is written to /tmp or to the
++# (read-only) image. OpenClaw runs embedded (`openclaw agent --local`, done by
++# the skill fork's lib_agent), so no gateway process/port is needed.
++#
++# Required env:
++#   PINCHBENCH_WORK_BASE  per-rollout dir (must NOT be under /tmp)
++#   TASK_ID MODEL_NAME MODEL_BASE_URL JUDGE_MODEL JUDGE_BASE_URL JUDGE_API_KEY
++# Optional env:
++#   MODEL_API_KEY (default EMPTY)        PINCHBENCH_SKILL_DIR (default /opt/pinchbench)
++#   PINCHBENCH_PYTHON (default python3)  JUDGE_FALLBACK_MODEL
++#   PINCHBENCH_CONTEXT_WINDOW (65536)    PINCHBENCH_MAX_TOKENS (16384)
++#   PINCHBENCH_WEB_SEARCH_PROVIDER (tavily) + TAVILY_API_KEY / BRAVE_API_KEY
++#   PINCHBENCH_WEB_FETCH_MAX_CHARS (12000)
++#   PINCHBENCH_SAMPLING_PARAMS  JSON merged into the model's request params
++#                               (default temperature=1, top_p=0.95, top_k=64;
++#                               a null value drops a default key)
++#   PINCHBENCH_MAX_TOKENS_FIELD (max_tokens; e.g. max_completion_tokens for Azure)
++#   PINCHBENCH_MODEL_REASONING (0)  1 = mark the model "reasoning": true in OpenClaw
++#   PINCHBENCH_THINKING        OpenClaw --thinking level (unset = default)
++#   PINCHBENCH_PROVIDER_TIMEOUT_SECONDS PINCHBENCH_AGENT_TIMEOUT_SECONDS
++#   PINCHBENCH_STUCK_SESSION_ABORT_SECONDS PINCHBENCH_PROVIDER_HEADERS (JSON)
++#   TIMEOUT_MULT (default 3)   PINCHBENCH_VERBOSE=1
++# Output: results JSON + transcripts in $PINCHBENCH_WORK_BASE/out (run.log too).
++set -uo pipefail
++
++: "${PINCHBENCH_WORK_BASE:?run_task_local.sh needs PINCHBENCH_WORK_BASE}"
++: "${TASK_ID:?}" "${MODEL_NAME:?}" "${MODEL_BASE_URL:?}" "${JUDGE_MODEL:?}" "${JUDGE_BASE_URL:?}"
++BASE="$(mkdir -p "$PINCHBENCH_WORK_BASE" && cd "$PINCHBENCH_WORK_BASE" && pwd -P)"
++case "$BASE" in
++  /tmp|/tmp/*|/var/tmp|/var/tmp/*)
++    echo "[run_task_local] refusing PINCHBENCH_WORK_BASE under /tmp: $BASE" >&2; exit 2 ;;
++esac
++
++SKILL="${PINCHBENCH_SKILL_DIR:-/opt/pinchbench}"
++PY="${PINCHBENCH_PYTHON:-python3}"
++OUT="$BASE/out"
++WORK="$BASE/work"
++
++export HOME="$BASE/home"
++export OPENCLAW_STATE_DIR="$HOME/.openclaw"
++export PINCHBENCH_WORKDIR="$BASE/pb"
++export PINCHBENCH_RUN_ROOT="$PINCHBENCH_WORKDIR/runs"
++export PINCHBENCH_LOG_DIR="$OUT"
++export TMPDIR="$BASE/tmp" TMP="$BASE/tmp" TEMP="$BASE/tmp"
++export XDG_CONFIG_HOME="$HOME/.config" XDG_DATA_HOME="$HOME/.local/share" XDG_CACHE_HOME="$BASE/cache"
++export NPM_CONFIG_CACHE="$BASE/cache/npm" NPM_CONFIG_UPDATE_NOTIFIER=false NO_UPDATE_NOTIFIER=1
++export FWS_DATA_DIR="$BASE/fws" GH_CONFIG_DIR="$BASE/gh" GH_NO_UPDATE_NOTIFIER=1 GH_PROMPT_DISABLED=1
++export UV_CACHE_DIR="${UV_CACHE_DIR_OVERRIDE:-$BASE/cache/uv}"
++export PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
++export PINCHBENCH_ENV_DONE=1   # paths already isolated; do not let pinchbench_env.sh re-resolve
++mkdir -p "$OUT" "$WORK" "$OPENCLAW_STATE_DIR" "$PINCHBENCH_RUN_ROOT" "$TMPDIR" \
++  "$XDG_CONFIG_HOME" "$XDG_DATA_HOME" "$XDG_CACHE_HOME" "$FWS_DATA_DIR" "$GH_CONFIG_DIR"
++
++# Detach this script and every descendant (OpenClaw tool subprocesses can
++# outlive it) from the parent's pipes; the agent reads run.log on failure.
++exec >"$OUT/run.log" 2>&1
++
++export MODEL_API_KEY="${MODEL_API_KEY:-EMPTY}"
++export OPENAI_API_KEY="${OPENAI_API_KEY:-$MODEL_API_KEY}"
++export JUDGE_API_KEY="${JUDGE_API_KEY:-${AZURE_OPENAI_API_KEY:-}}"
++export PINCHBENCH_WEB_SEARCH_PROVIDER="${PINCHBENCH_WEB_SEARCH_PROVIDER:-tavily}"
++export PINCHBENCH_WEB_FETCH_MAX_CHARS="${PINCHBENCH_WEB_FETCH_MAX_CHARS:-12000}"
++
++# Seed OpenClaw config: one "custom" OpenAI-compatible provider pointing at the
++# policy endpoint (NeMo Gym token-capture URL during RL), with the context
++# window / max tokens / sampling params the experiment fixes. benchmark.py is
++# then given --model custom/<MODEL_NAME>, which lib_agent resolves from here.
++"$PY" - <<'PYCFG' || { echo "[run_task_local] failed to write openclaw.json"; exit 3; }
++import json, os
++from pathlib import Path
++
++cfg_path = Path(os.environ["OPENCLAW_STATE_DIR"]) / "openclaw.json"
++try:
++    cfg = json.loads(cfg_path.read_text("utf-8-sig")) if cfg_path.exists() else {}
++except Exception:
++    cfg = {}
++
++def env_int(name, default):
++    v = os.environ.get(name, "").strip()
++    return int(v) if v else default
++
++model_id = os.environ["MODEL_NAME"]
++max_tokens = env_int("PINCHBENCH_MAX_TOKENS", 16384)
++context_window = env_int("PINCHBENCH_CONTEXT_WINDOW", 65536)
++params = {
++    "temperature": 1.0,
++    "top_p": 0.95,
++    "top_k": 64,
++    # Keep Gemma-4 channel/thinking markers in the returned text so OpenClaw
++    # replays them verbatim on the next tool turn (thinking continuity and
++    # token-capture prefix contiguity).
++    "skip_special_tokens": False,
++    "chat_template_kwargs": {"enable_thinking": True},
++    "maxTokens": max_tokens,
++    "max_tokens": max_tokens,
++}
++if os.environ.get("PINCHBENCH_SAMPLING_PARAMS"):
++    params.update(json.loads(os.environ["PINCHBENCH_SAMPLING_PARAMS"]))
++    # a null value removes a default (e.g. top_k for endpoints that reject it)
++    params = {k: v for k, v in params.items() if v is not None}
++provider = {
++    "baseUrl": os.environ["MODEL_BASE_URL"].rstrip("/"),
++    "apiKey": os.environ.get("MODEL_API_KEY") or "EMPTY",
++    "api": "openai-completions",
++    "models": [{
++        "id": model_id,
++        "name": model_id,
++        "input": ["text"],
++        "reasoning": os.environ.get("PINCHBENCH_MODEL_REASONING", "0") == "1",
++        "cost": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0},
++        "contextWindow": context_window,
++        "contextTokens": context_window,
++        "maxTokens": max_tokens,
++        "params": params,
++        "compat": {
++            "requiresStringContent": True,
++            "supportsUsageInStreaming": True,
++            "maxTokensField": os.environ.get("PINCHBENCH_MAX_TOKENS_FIELD", "max_tokens"),
++        },
++    }],
++}
++if os.environ.get("PINCHBENCH_PROVIDER_TIMEOUT_SECONDS"):
++    provider["timeoutSeconds"] = int(os.environ["PINCHBENCH_PROVIDER_TIMEOUT_SECONDS"])
++if os.environ.get("PINCHBENCH_PROVIDER_HEADERS"):
++    provider["headers"] = json.loads(os.environ["PINCHBENCH_PROVIDER_HEADERS"])
++models = cfg.setdefault("models", {})
++models["mode"] = "merge"
++models.setdefault("providers", {})["custom"] = provider
++defaults = cfg.setdefault("agents", {}).setdefault("defaults", {})
++ref = f"custom/{model_id}"
++defaults.setdefault("models", {})[ref] = {"params": params}
++defaults.setdefault("model", {})["primary"] = ref
++if os.environ.get("PINCHBENCH_AGENT_TIMEOUT_SECONDS"):
++    defaults["timeoutSeconds"] = int(os.environ["PINCHBENCH_AGENT_TIMEOUT_SECONDS"])
++if os.environ.get("PINCHBENCH_STUCK_SESSION_ABORT_SECONDS"):
++    cfg.setdefault("diagnostics", {})["stuckSessionAbortMs"] = int(os.environ["PINCHBENCH_STUCK_SESSION_ABORT_SECONDS"]) * 1000
++web = cfg.setdefault("tools", {}).setdefault("web", {})
++web.setdefault("search", {}).update({"enabled": True, "provider": os.environ["PINCHBENCH_WEB_SEARCH_PROVIDER"]})
++web.setdefault("fetch", {})["maxChars"] = int(os.environ["PINCHBENCH_WEB_FETCH_MAX_CHARS"])
++# OpenClaw's file log defaults to /tmp/openclaw/openclaw-<date>.log (ignores TMPDIR).
++cfg.setdefault("logging", {})["file"] = os.path.join(os.environ["PINCHBENCH_LOG_DIR"], "openclaw.log")
++cfg_path.parent.mkdir(parents=True, exist_ok=True)
++cfg_path.write_text(json.dumps(cfg, indent=2, ensure_ascii=False), "utf-8")
++os.chmod(cfg_path, 0o600)
++PYCFG
++
++cd "$WORK"
++args=(
++  --model "custom/$MODEL_NAME"
++  --judge "$JUDGE_MODEL"
++  --judge-base-url "$JUDGE_BASE_URL"
++  --suite "$TASK_ID"
++  --no-upload --no-fail-fast --no-judge-cache
++  --timeout-multiplier "${TIMEOUT_MULT:-3}"
++  --output-dir "$OUT"
++)
++[[ -n "${JUDGE_FALLBACK_MODEL:-}" ]] && args+=(--judge-fallback "$JUDGE_FALLBACK_MODEL")
++[[ -n "${PINCHBENCH_THINKING:-}" ]] && args+=(--thinking "$PINCHBENCH_THINKING")
++[[ "${PINCHBENCH_VERBOSE:-0}" == "1" ]] && args+=(--verbose)
++
++echo "[run_task_local] task=$TASK_ID model=custom/$MODEL_NAME base=$BASE skill=$SKILL $(openclaw --version 2>/dev/null)"
++"$PY" "$SKILL/scripts/benchmark.py" "${args[@]}"
++rc=$?
++
++if [[ "${NEMO_GYM_OBSERVABILITY_ENABLED:-0}" == "1" ]]; then
++  # Agent dirs also hold credentials; keep only session metadata + transcripts.
++  for sessions_dir in "$OPENCLAW_STATE_DIR"/agents/*/sessions; do
++    [[ -d "$sessions_dir" ]] || continue
++    agent_id=$(basename "$(dirname "$sessions_dir")")
++    dest="$OUT/openclaw_sessions/agents/$agent_id"
++    mkdir -p "$dest"
++    cp -a "$sessions_dir" "$dest/" 2>/dev/null || true
++  done
++fi
++echo "[run_task_local] benchmark.py exit=$rc"
++exit "$rc"
+diff --git a/responses_api_agents/pinchbench/tests/test_local_provider.py b/responses_api_agents/pinchbench/tests/test_local_provider.py
+new file mode 100644
+index 00000000..c0007dd0
+--- /dev/null
++++ b/responses_api_agents/pinchbench/tests/test_local_provider.py
+@@ -0,0 +1,194 @@
++# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++"""Tests for the container-less `sandbox_provider: {local: {...}}` mode and
++judge-failure masking."""
++
++import json
++import os
++import textwrap
++from pathlib import Path
++from unittest.mock import MagicMock
++
++import pytest
++
++from nemo_gym.server_utils import ServerClient
++from responses_api_agents.pinchbench import app as pb_app
++from responses_api_agents.pinchbench.app import (
++    PinchBenchAgent,
++    PinchBenchAgentConfig,
++    resolve_local_work_root,
++)
++
++
++@pytest.fixture
++def allow_tmp(monkeypatch):
++    # pytest's tmp_path lives under /tmp, which the local provider refuses on purpose.
++    monkeypatch.setattr(pb_app, "_TMP_PREFIXES", ())
++
++
++def make_agent(**over) -> PinchBenchAgent:
++    base = dict(
++        name="pinchbench",
++        host="0.0.0.0",
++        port=0,
++        entrypoint="app.py",
++        model_base_url="http://policy/v1",
++        model_api_key="EMPTY",
++        model_name="gemma4",
++        judge_model="gpt-5.4-mini",
++        judge_base_url="https://judge.example/openai/v1",
++        judge_api_key="sk-judge",
++        judge_fallback_model="gpt-5.4",
++        web_search_provider="tavily",
++        tavily_api_key="tvly-test",
++        sandbox_provider={"local": {}},
++        context_window=65536,
++        max_tokens=16384,
++        web_fetch_max_chars=12000,
++        sampling_params={"temperature": 1.0, "top_p": 0.95, "top_k": 64},
++    )
++    base.update(over)
++    return PinchBenchAgent(config=PinchBenchAgentConfig(**base), server_client=MagicMock(spec=ServerClient))
++
++
++def _write_script(path: Path, body: str) -> Path:
++    path.write_text("#!/usr/bin/env bash\nset -u\n" + textwrap.dedent(body))
++    path.chmod(0o755)
++    return path
++
++
++def test_local_provider_config_needs_no_image():
++    agent = make_agent(sandbox_spec={"image": "/does/not/exist.sqsh"})
++    assert "local" in agent.config.sandbox_provider
++
++
++def test_resolve_local_work_root_rejects_tmp(monkeypatch):
++    for name in ("PINCHBENCH_GYM_WORK_ROOT", "PINCHBENCH_WORKDIR", "SLURM_TMPDIR", "SLURM_JOB_ID"):
++        monkeypatch.delenv(name, raising=False)
++    with pytest.raises(ValueError):
++        resolve_local_work_root("/tmp/pinchbench-should-not-be-used")
++
++
++def test_resolve_local_work_root_env_order(tmp_path, monkeypatch, allow_tmp):
++    monkeypatch.delenv("PINCHBENCH_GYM_WORK_ROOT", raising=False)
++    monkeypatch.setenv("PINCHBENCH_WORKDIR", str(tmp_path / "pbw"))
++    monkeypatch.setenv("SLURM_TMPDIR", str(tmp_path / "slurm"))
++    assert resolve_local_work_root() == (tmp_path / "pbw" / "gym").resolve()
++
++
++def test_task_env_forwards_experiment_knobs():
++    env = make_agent()._task_env("task_stock")
++    assert env["PINCHBENCH_CONTEXT_WINDOW"] == "65536"
++    assert env["PINCHBENCH_WEB_FETCH_MAX_CHARS"] == "12000"
++    assert env["JUDGE_FALLBACK_MODEL"] == "gpt-5.4"
++    assert env["TAVILY_API_KEY"] == "tvly-test"
++    assert env["PINCHBENCH_WEB_SEARCH_PROVIDER"] == "tavily"
++    assert json.loads(env["PINCHBENCH_SAMPLING_PARAMS"])["top_k"] == 64
++
++
++@pytest.mark.asyncio
++async def test_run_local_isolates_and_collects(tmp_path, monkeypatch, allow_tmp):
++    script = _write_script(
++        tmp_path / "fake_run_task.sh",
++        """
++        out="$PINCHBENCH_WORK_BASE/out"; mkdir -p "$out"
++        # leave a straggler behind; the agent must reap the process group
++        (sleep 300 &) ; echo $$ > "$PINCHBENCH_WORK_BASE/../pid_$TASK_ID"
++        python3 - <<'PY'
++        import json, os
++        assert os.environ["PINCHBENCH_WORK_BASE"]
++        assert "OPENCLAW_GATEWAY_TOKEN" not in os.environ
++        out = os.path.join(os.environ["PINCHBENCH_WORK_BASE"], "out")
++        json.dump({"tasks": [{"task_id": os.environ["TASK_ID"], "grading": {"mean": 0.75,
++                   "runs": [{"grading_type": "hybrid", "breakdown": {}, "notes": "", "judge_failed": False}]}}]},
++                  open(os.path.join(out, "results.json"), "w"))
++        json.dump(dict(os.environ), open(os.path.join(out, "env.txt"), "w"))
++        PY
++        """,
++    )
++    agent = make_agent(
++        sandbox_provider={"local": {"work_root": str(tmp_path / "root"), "run_task_script": str(script)}},
++        work_root=str(tmp_path / "work"),
++        transcripts_dir=str(tmp_path / "tx"),
++    )
++    out_dir = tmp_path / "work" / "r1"
++    out_dir.mkdir(parents=True)
++    rc = await agent._run_local("task_stock", out_dir, agent.config.sandbox_provider["local"])
++    assert rc is None
++    env = json.loads((out_dir / "env.txt").read_text())
++    assert env["TASK_ID"] == "task_stock"
++    assert env["MODEL_BASE_URL"] == "http://policy/v1"
++    assert env["PINCHBENCH_WORK_BASE"].startswith(str((tmp_path / "root").resolve()))
++    result = agent._parse_result("task_stock", out_dir)
++    assert result["reward"] == 0.75 and result["judge_failed"] is False
++    # per-rollout dir is removed unless keep_workdirs
++    assert not any((tmp_path / "root" / "rollouts").iterdir())
++
++
++@pytest.mark.asyncio
++async def test_run_local_failure_without_results_raises(tmp_path, allow_tmp):
++    script = _write_script(tmp_path / "fail.sh", 'mkdir -p "$PINCHBENCH_WORK_BASE/out"; echo boom > "$PINCHBENCH_WORK_BASE/out/run.log"; exit 4\n')
++    agent = make_agent(sandbox_provider={"local": {"work_root": str(tmp_path / "root"), "run_task_script": str(script)}})
++    with pytest.raises(RuntimeError, match="boom"):
++        await agent._run_local("task_x", tmp_path / "o", agent.config.sandbox_provider["local"])
++
++
++@pytest.mark.asyncio
++async def test_run_local_timeout(tmp_path, allow_tmp):
++    script = _write_script(tmp_path / "slow.sh", "sleep 30\n")
++    agent = make_agent(
++        task_timeout_s=1,
++        sandbox_provider={"local": {"work_root": str(tmp_path / "root"), "run_task_script": str(script)}},
++    )
++    with pytest.raises(TimeoutError):
++        await agent._run_local("task_x", tmp_path / "o", agent.config.sandbox_provider["local"])
++
++
++@pytest.mark.asyncio
++async def test_judge_failure_masks_sample(tmp_path, monkeypatch, allow_tmp):
++    agent = make_agent(
++        sandbox_provider={"local": {"work_root": str(tmp_path / "root")}},
++        work_root=str(tmp_path / "work"),
++        transcripts_dir=str(tmp_path / "tx"),
++    )
++
++    async def ok(task_id, out_dir, rollout_id=None):
++        (out_dir / "results.json").write_text(json.dumps({"tasks": [{"task_id": task_id, "grading": {
++            "mean": 0.0, "runs": [{"grading_type": "llm_judge", "breakdown": {}, "notes": "LLM judge failed", "judge_failed": True}]}}]}))
++        return None
++
++    monkeypatch.setattr(agent, "_run_in_sandbox", ok)
++    body = MagicMock()
++    body.model_dump.return_value = {
++        "responses_create_params": {"input": [{"role": "user", "content": "hi"}]},
++        "verifier_metadata": {"task_id": "task_events"},
++    }
++    resp = (await agent.run(body=body)).model_dump()
++    assert resp["instance_config"]["mask_sample"] is True
++    assert resp["status"] == "judge_failed"
++
++
++@pytest.mark.asyncio
++async def test_judge_failure_mask_can_be_disabled(tmp_path, monkeypatch, allow_tmp):
++    agent = make_agent(mask_on_judge_failure=False, work_root=str(tmp_path / "work"), transcripts_dir=str(tmp_path / "tx"))
++
++    async def ok(task_id, out_dir, rollout_id=None):
++        (out_dir / "results.json").write_text(json.dumps({"tasks": [{"task_id": task_id, "grading": {
++            "mean": 0.0, "runs": [{"grading_type": "llm_judge", "judge_failed": True}]}}]}))
++
++    monkeypatch.setattr(agent, "_run_in_sandbox", ok)
++    body = MagicMock()
++    body.model_dump.return_value = {"responses_create_params": {"input": "x"}, "verifier_metadata": {"task_id": "t"}}
++    resp = (await agent.run(body=body)).model_dump()
++    assert "mask_sample" not in (resp.get("instance_config") or {})
