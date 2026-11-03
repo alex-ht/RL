@@ -1,0 +1,25 @@
+# Prefetch (bake) the NeMo Gym server venvs the PinchBench GRPO run needs into
+# /opt/gym_venvs at image build time, so a read-only enroot rootfs never has to
+# create them at runtime. Only env.nemo_gym is read (dry-run NemoGym._spinup);
+# the dummy values below only satisfy the bundled configs' interpolations.
+env:
+  should_use_nemo_gym: true
+  nemo_gym:
+    skip_venv_if_present: true
+    port_range_low: 5000
+    port_range_high: 5999
+    policy_model_name: dummy-model
+    policy_base_url: http://localhost:8000/v1
+    policy_api_key: dummy
+    sandbox_image: docker://dummy
+    model_base_url: http://localhost:8000/v1
+    model_api_key: dummy
+    model_name: dummy
+    judge_model: dummy
+    judge_base_url: http://localhost:8001/v1
+    judge_api_key: dummy
+    brave_api_key: dummy
+    tavily_api_key: dummy
+    config_paths:
+      - responses_api_models/vllm_model/configs/vllm_model_for_training.yaml
+      - responses_api_agents/pinchbench/configs/pinchbench.yaml

@@ -346,10 +346,10 @@ index 658b7a33..64e03385 100644
              "archived_to": archive_path,
 diff --git a/responses_api_agents/pinchbench/run_task_local.sh b/responses_api_agents/pinchbench/run_task_local.sh
 new file mode 100755
-index 00000000..a2c7aa8a
+index 00000000..b3a104e4
 --- /dev/null
 +++ b/responses_api_agents/pinchbench/run_task_local.sh
-@@ -0,0 +1,186 @@
+@@ -0,0 +1,191 @@
 +#!/usr/bin/env bash
 +# Local (container-less) PinchBench task runner for the pinchbench agent's
 +# `sandbox_provider: {local: {...}}` mode. Used where no per-task container
@@ -381,6 +381,7 @@ index 00000000..a2c7aa8a
 +#   PINCHBENCH_THINKING        OpenClaw --thinking level (unset = default)
 +#   PINCHBENCH_PROVIDER_TIMEOUT_SECONDS PINCHBENCH_AGENT_TIMEOUT_SECONDS
 +#   PINCHBENCH_STUCK_SESSION_ABORT_SECONDS PINCHBENCH_PROVIDER_HEADERS (JSON)
++#   PINCHBENCH_AGENT_PATH_PREFIX (default /usr/local/bin:/usr/bin, prepended to PATH)
 +#   TIMEOUT_MULT (default 3)   PINCHBENCH_VERBOSE=1
 +# Output: results JSON + transcripts in $PINCHBENCH_WORK_BASE/out (run.log too).
 +set -uo pipefail
@@ -409,6 +410,10 @@ index 00000000..a2c7aa8a
 +export FWS_DATA_DIR="$BASE/fws" GH_CONFIG_DIR="$BASE/gh" GH_NO_UPDATE_NOTIFIER=1 GH_PROMPT_DISABLED=1
 +export UV_CACHE_DIR="${UV_CACHE_DIR_OVERRIDE:-$BASE/cache/uv}"
 +export PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
++# The agent's exec tool should see the system python (task deps) rather than a
++# training venv that may be first on PATH in the training image.
++_pb_prefix="${PINCHBENCH_AGENT_PATH_PREFIX-/usr/local/bin:/usr/bin}"   # set empty to disable
++[[ -n "$_pb_prefix" ]] && export PATH="$_pb_prefix:$PATH"
 +export PINCHBENCH_ENV_DONE=1   # paths already isolated; do not let pinchbench_env.sh re-resolve
 +mkdir -p "$OUT" "$WORK" "$OPENCLAW_STATE_DIR" "$PINCHBENCH_RUN_ROOT" "$TMPDIR" \
 +  "$XDG_CONFIG_HOME" "$XDG_DATA_HOME" "$XDG_CACHE_HOME" "$FWS_DATA_DIR" "$GH_CONFIG_DIR"

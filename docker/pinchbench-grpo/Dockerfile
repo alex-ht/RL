@@ -89,6 +89,17 @@ RUN chmod 0755 /opt/nemo-rl/3rdparty/Gym-workspace/Gym/responses_api_agents/pinc
         "${RL_COMMIT}" "${PINCHBENCH_SKILL_COMMIT}" "${OPENCLAW_VERSION}" "${FWS_VERSION}" "${BASE_IMAGE}" \
         > /opt/pinchbench-grpo/BUILD_INFO
 
+# Bake the Gym server venvs (vllm_model proxy + pinchbench agent) into
+# /opt/gym_venvs: under enroot the rootfs is read-only, so Gym cannot create
+# them at runtime. Same mechanism as docker/Dockerfile NEMO_GYM_PREFETCH_CONFIGS.
+RUN cd /opt/nemo-rl \
+    && UV_LINK_MODE=symlink uv run --frozen python examples/nemo_gym/prefetch_venvs.py \
+        /opt/pinchbench-grpo/prefetch_pinchbench_envs.yaml 2>&1 | tee /opt/pinchbench-grpo/prefetch.log \
+    && grep -q "Succeeded: 1" /opt/pinchbench-grpo/prefetch.log \
+    && ls -la "${NEMO_GYM_VENV_DIR}" \
+    && find /opt/gym_venvs -name ray_dist.jar -delete \
+    && chmod -R a+rX /opt/gym_venvs
+
 ENV PINCHBENCH_SKILL_DIR=/opt/pinchbench \
     PINCHBENCH_PYTHON=/usr/bin/python3 \
     PINCHBENCH_IMAGE=1 \
