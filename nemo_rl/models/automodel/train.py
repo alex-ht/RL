@@ -294,6 +294,43 @@ def _cp_gather_logits(
     return cp_sharder.gather_token_tensor(logits, seq_dim=seq_dim, trim=True)
 
 
+def _rlpb_prepare_deferred_lm_head(prepared, data_dict, post_processing_fn, sampling_params):
+    """RL_Pinchbench: feed chunked lm_head targets into the Gemma4 forward.
+
+    CP-local targets match get_cp_sharded_next_token_logprobs: roll the canonical
+    ids, then shard with the same sharder. The model projects one chunk at a time.
+    """
+    if not isinstance(post_processing_fn, (LossPostProcessor, LogprobsPostProcessor)):
+        return
+    sp = getattr(post_processing_fn, "sampling_params", None) or sampling_params
+    if need_top_k_or_top_p_filtering(sp):
+        return
+    cp_sharder = prepared.cp_sharder
+    if cp_sharder is None:
+        return
+    cfg = getattr(post_processing_fn, "cfg", None)
+    chunk_size = 1024
+    if isinstance(cfg, dict) and cfg.get("logprob_chunk_size"):
+        chunk_size = int(cfg["logprob_chunk_size"])
+    temperature = 1.0
+    if sp is not None and getattr(sp, "temperature", None) not in (None, 1, 1.0):
+        temperature = float(sp.temperature)
+    global_targets = data_dict["input_ids"].roll(shifts=-1, dims=1)
+    prepared.model_batch["rlpb_local_targets"] = cp_sharder.shard_token_tensor(
+        global_targets, seq_dim=1, fill=0
+    )
+    prepared.model_batch["rlpb_chunk_size"] = chunk_size
+    prepared.model_batch["rlpb_temperature"] = temperature
+
+
+def _rlpb_gather_local_logprobs(logits, cp_sharder):
+    if cp_sharder is None:
+        raise RuntimeError("RL_Pinchbench chunked lm_head requires the CP sharder")
+    gathered = cp_sharder.gather_token_tensor(logits, seq_dim=1, trim=True)[:, :-1]
+    gathered.rlpb_is_logprobs = True
+    return gathered
+
+
 def forward_with_post_processing_fn(
     model: nn.Module,
     prepared: PreparedModelForward,
@@ -344,15 +381,19 @@ def forward_with_post_processing_fn(
         )
 
     # Model forward pass
+    # RL_Pinchbench: feed chunked lm_head targets before the forward.
+    _rlpb_prepare_deferred_lm_head(prepared, data_dict, post_processing_fn, sampling_params)
     outputs = model_forward(model, prepared.model_batch)
 
     # Extract logits from model outputs
     logits = extract_logits(model, outputs)
     del outputs
+    if getattr(logits, "rlpb_local_logprobs", False):
+        logits = _rlpb_gather_local_logprobs(logits, cp_sharder)
 
     # Apply temperature scaling only for sampling-oriented post-processors
     # Score computations should use unscaled logits
-    if isinstance(
+    if not getattr(logits, "rlpb_is_logprobs", False) and isinstance(
         post_processing_fn,
         (
             LossPostProcessor,
@@ -632,6 +673,16 @@ class LossPostProcessor:
         # Under CP, ``logits`` is this rank's local shard while ``data_dict``
         # stays canonical; the sharder maps between the two.
         token_layout = cp_sharder
+        if getattr(logits, "rlpb_is_logprobs", False):
+            if self.enable_seq_packing:
+                raise RuntimeError("RL_Pinchbench chunked lm_head does not support sequence packing")
+            loss, loss_metrics = self.loss_fn(
+                data=data_dict,
+                global_valid_seqs=global_valid_seqs,
+                global_valid_toks=global_valid_toks,
+                next_token_logprobs=logits,
+            )
+            return loss, loss_metrics
         if token_layout is not None:
             input_type = self.loss_fn.input_type
             if input_type == LossInputType.LOGIT:
@@ -739,7 +790,14 @@ class LogprobsPostProcessor:
         """
         input_lengths = data_dict["input_lengths"]
 
-        if cp_sharder is not None:
+        if getattr(logits, "rlpb_is_logprobs", False):
+            token_logprobs = logits
+            seq_len = data_dict["input_ids"].shape[1]
+            if token_logprobs.shape[1] != seq_len - 1:
+                raise RuntimeError(
+                    f"RL_Pinchbench logprobs shape {tuple(token_logprobs.shape)} != canonical {seq_len - 1}"
+                )
+        elif cp_sharder is not None:
             # ``data_dict`` stays canonical under CP: ``_build_model_batch`` clones
             # the model-facing tensors so Automodel's in-place buffer sharding
             # cannot reach the loss-side ones. Shift and gather against that

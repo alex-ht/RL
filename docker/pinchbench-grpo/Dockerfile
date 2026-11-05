@@ -12,9 +12,8 @@
 # compile CUDA code; the steps that could build anything from source are capped
 # by BUILD_MAX_JOBS (see the Gym venv prefetch below) to keep host RAM bounded.
 #
-# Build (context = this directory; see build_and_push.sh):
-#   docker build --build-arg RL_COMMIT=$(git rev-parse HEAD) \
-#     -t alexht/nemo-rl:pinchbench-grpo-<sha> docker/pinchbench-grpo
+# Build (context = repo root; see build_and_push.sh):
+#   docker/pinchbench-grpo/build_and_push.sh
 ARG BASE_IMAGE=alexht/nemo-rl:7ef8e83e
 ARG NODE_IMAGE=node:22-bookworm
 
@@ -84,12 +83,52 @@ RUN UV_CONCURRENT_BUILDS=1 MAX_JOBS="${BUILD_MAX_JOBS}" \
         tabulate openpyxl pypdf pdfplumber pytest \
     && /usr/bin/python3 -c "import yaml, requests, bs4, lxml, pandas, pypdf, pdfplumber, pytest; print('task deps OK')"
 
-# Gym pinchbench agent with the local (container-less) run mode. The Gym
-# submodule (NVIDIA-NeMo/Gym @ da9f6714) is not a fork we can push, so the
-# change is carried in this directory as a patch and applied here.
-COPY . /opt/pinchbench-grpo/
+# Build context is the repo root (see build_and_push.sh). The base image is
+# still alexht/nemo-rl:7ef8e83e, so owned-file fixes are copied over /opt/nemo-rl
+# and third-party fixes are patches. Gym and Automodel are upstream submodules,
+# not forks we can push.
+COPY docker/pinchbench-grpo/ /opt/pinchbench-grpo/
+COPY nemo_rl/models/generation/vllm/vllm_worker_async.py \
+     /opt/nemo-rl/nemo_rl/models/generation/vllm/vllm_worker_async.py
+COPY nemo_rl/models/policy/workers/automodel_policy_worker.py \
+     /opt/nemo-rl/nemo_rl/models/policy/workers/automodel_policy_worker.py
+COPY nemo_rl/models/automodel/train.py \
+     /opt/nemo-rl/nemo_rl/models/automodel/train.py
 RUN cd /opt/nemo-rl/3rdparty/Gym-workspace/Gym \
-    && git apply --verbose /opt/pinchbench-grpo/gym-pinchbench-local.patch
+    && git apply --verbose /opt/pinchbench-grpo/gym-pinchbench-local.patch \
+    && git apply --verbose /opt/pinchbench-grpo/gym-lineage-grok.patch \
+    && cd /opt/nemo-rl/3rdparty/Automodel-workspace/Automodel \
+    && git apply --verbose /opt/pinchbench-grpo/automodel-gemma4-cp-logprob.patch \
+    && find /opt/nemo-rl/nemo_rl/models/generation/vllm \
+             /opt/nemo-rl/nemo_rl/models/policy/workers \
+             /opt/nemo-rl/nemo_rl/models/automodel \
+             /opt/nemo-rl/3rdparty/Gym-workspace/Gym/nemo_gym/token_id_capture \
+             /opt/nemo-rl/3rdparty/Gym-workspace/Gym/responses_api_agents/pinchbench \
+             /opt/nemo-rl/3rdparty/Automodel-workspace/Automodel/nemo_automodel/components/distributed \
+             /opt/nemo-rl/3rdparty/Automodel-workspace/Automodel/nemo_automodel/components/models/gemma4_moe \
+             -name '*.pyc' -delete
+# OpenClaw strips non-alnum tool-call ids. vLLM's default id has a hyphen, so
+# the next turn's lineage fingerprint cannot find its parent.
+RUN <<"PY" python3 -
+import pathlib
+needle = 'return f"chatcmpl-tool-{random_uuid()}"'
+repl = 'return f"chatcmpltool{random_uuid()}"'
+roots = [pathlib.Path("/opt/ray_venvs"), pathlib.Path("/opt/nemo_rl_venv")]
+found = 0
+for root in roots:
+    if not root.is_dir():
+        continue
+    for path in root.rglob("vllm/entrypoints/chat_utils.py"):
+        text = path.read_text()
+        if needle not in text and repl not in text:
+            raise SystemExit(f"tool call id anchor missing: {path}")
+        if needle in text:
+            path.write_text(text.replace(needle, repl, 1))
+        found += 1
+if found == 0:
+    raise SystemExit("vllm chat_utils.py not found")
+print(f"patched tool call id in {found} chat_utils.py")
+PY
 RUN chmod 0755 /opt/nemo-rl/3rdparty/Gym-workspace/Gym/responses_api_agents/pinchbench/run_task_local.sh \
     && chmod -R a+rX /opt/pinchbench-grpo /opt/nemo-rl/3rdparty/Gym-workspace/Gym/responses_api_agents/pinchbench \
     && printf 'rl_commit=%s\nskill_commit=%s\nopenclaw=%s\nfws=%s\nbase=%s\n' \
@@ -137,6 +176,23 @@ grep -q "Succeeded: 1" /opt/pinchbench-grpo/prefetch.log
 ls -la "${NEMO_GYM_VENV_DIR}"
 find /opt/gym_venvs -name ray_dist.jar -delete
 chmod -R a+rX /opt/gym_venvs
+EOF
+
+# Split Inductor/Triton caches by host and pid. Same-node ranks otherwise write
+# one cache directory and corrupt flex kernels.
+RUN <<"EOF" bash -exuo pipefail
+installed=0
+shopt -s nullglob
+for site in /opt/ray_venvs/*/lib/python3.13/site-packages /opt/nemo_rl_venv/lib/python3.13/site-packages /opt/gym_venvs/*/lib/python3.13/site-packages; do
+  if [ ! -d "$site" ]; then
+    continue
+  fi
+  cp /opt/pinchbench-grpo/rlpb_inductor_cache.py "$site/rlpb_inductor_cache.py"
+  printf '%s\n' 'import rlpb_inductor_cache' > "$site/rlpb_inductor_cache.pth"
+  rm -f "$site"/__pycache__/rlpb_inductor_cache*.pyc
+  installed=1
+done
+test "$installed" -eq 1
 EOF
 
 ENV PINCHBENCH_SKILL_DIR=/opt/pinchbench \

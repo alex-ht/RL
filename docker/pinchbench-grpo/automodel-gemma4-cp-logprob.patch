@@ -1,0 +1,226 @@
+diff --git a/nemo_automodel/components/distributed/activation_checkpointing.py b/nemo_automodel/components/distributed/activation_checkpointing.py
+index 264d3b2..1a74707 100644
+--- a/nemo_automodel/components/distributed/activation_checkpointing.py
++++ b/nemo_automodel/components/distributed/activation_checkpointing.py
+@@ -348,6 +348,10 @@ def ensure_fsdp_ops_sac_ignored() -> None:
+                     "aten.empty.memory_format",
+                     "aten.empty_like",
+                     "aten.view",
++                    # RL_Pinchbench: ignore lift_fresh (compiled flex hides it on forward;
++                    # checkpoint recompute emits it). Copy-only, same class as detach.
++                    "aten.lift_fresh",
++                    "aten.lift_fresh_copy",
+                 ],
+             )
+         )
+diff --git a/nemo_automodel/components/models/gemma4_moe/cp_attention.py b/nemo_automodel/components/models/gemma4_moe/cp_attention.py
+index 010dacc..6df09ef 100644
+--- a/nemo_automodel/components/models/gemma4_moe/cp_attention.py
++++ b/nemo_automodel/components/models/gemma4_moe/cp_attention.py
+@@ -91,6 +91,12 @@ _BLOCK_MASK_GEN: list = [None, None]  # [data_ptr, held-tensor]
+ 
+ def _block_mask_set_generation(gen_tensor) -> None:
+     """Reset the per-step block-mask cache when a new batch (new metadata) arrives."""
++    # RL_Pinchbench: keep block mask during backward.
++    # Recompute builds new metadata (new data_ptr). Clearing the cache makes a new
++    # mask_mod, compiled flex guards miss, recompile_limit falls back to eager, and
++    # SAC sees a flex_attention HOP the forward never stored.
++    if torch._C._current_graph_task_id() != -1:
++        return
+     ptr = None if gen_tensor is None else gen_tensor.data_ptr()
+     if ptr != _BLOCK_MASK_GEN[0]:
+         _BLOCK_MASK_CACHE.clear()
+@@ -302,41 +308,61 @@ def _run_gemma4_flex_chunk(
+     try:
+         from torch.nn.attention.flex_attention import create_block_mask
+ 
+-        if (
+-            use_vision_bidirectional
+-            or packed_seq_ids_q is not None
+-            or packed_seq_ids_kv is not None
+-            or padding_mask_q is not None
+-            or padding_mask_kv is not None
+-        ):
+-
+-            def cp_mask(batch_idx, head_idx, q_idx, kv_idx):
+-                allowed = _base_gemma4_cp_mask(attention_module, ctx, q_idx, kv_idx, kv_global_start)
+-                if use_vision_bidirectional:
+-                    q_group = vision_group_ids_q[batch_idx, q_idx]
+-                    kv_group = vision_group_ids_kv[batch_idx, kv_idx]
+-                    same_vision_group = (q_group == kv_group) & (q_group >= 0)
+-                    allowed = allowed | same_vision_group
+-                if packed_seq_ids_q is not None and packed_seq_ids_kv is not None:
+-                    q_pack_id = packed_seq_ids_q[batch_idx, q_idx]
+-                    kv_pack_id = packed_seq_ids_kv[batch_idx, kv_idx]
+-                    allowed = allowed & (q_pack_id == kv_pack_id) & (q_pack_id > 0)
+-                    allowed = torch.where(q_pack_id <= 0, kv_idx == 0, allowed)
+-                if padding_mask_kv is not None:
+-                    kv_is_padding = padding_mask_kv[batch_idx, kv_idx]
+-                    allowed = allowed & ~kv_is_padding
+-                if padding_mask_q is not None:
+-                    q_is_padding = padding_mask_q[batch_idx, q_idx]
+-                    allowed = torch.where(q_is_padding, kv_idx == 0, allowed)
+-                return allowed
+-
+-            block_mask_batch = query.shape[0]
+-        else:
+-
+-            def cp_mask(batch_idx, head_idx, q_idx, kv_idx):
+-                return _base_gemma4_cp_mask(attention_module, ctx, q_idx, kv_idx, kv_global_start)
+-
+-            block_mask_batch = None
++        # RL_Pinchbench: stable flex mask.
++        # RL_Pinchbench: flex mask identity.
++        # No `is` / `is not None` inside cp_mask: Dynamo turns that into
++        # `packed_seq_ids_q is packed_seq_ids_kv` and recompiles per ring step.
++        _q_len = int(query.shape[2])
++        _kv_len = int(key_chunk.shape[2])
++        _bsz = int(query.shape[0])
++        # RL_Pinchbench: kv start snapshot.
++        # New 0-dim tensor each ring step, same shape and dtype. Dynamo does not
++        # guard that identity. Do not fill_ a tensor the flex replay has saved.
++        kv_start_t = torch.tensor(int(kv_global_start), device=query.device, dtype=torch.long)
++
++        def _rlpb_fill_seq(value, length, fill, dtype):
++            if isinstance(value, torch.Tensor):
++                return value
++            return torch.full((_bsz, length), fill, device=query.device, dtype=dtype)
++
++        packed_seq_ids_q = _rlpb_fill_seq(packed_seq_ids_q, _q_len, 1, torch.int32)
++        packed_seq_ids_kv = _rlpb_fill_seq(packed_seq_ids_kv, _kv_len, 1, torch.int32)
++        padding_mask_q = _rlpb_fill_seq(padding_mask_q, _q_len, False, torch.bool)
++        padding_mask_kv = _rlpb_fill_seq(padding_mask_kv, _kv_len, False, torch.bool)
++        vision_group_ids_q = _rlpb_fill_seq(vision_group_ids_q, _q_len, -1, torch.int32)
++        vision_group_ids_kv = _rlpb_fill_seq(vision_group_ids_kv, _kv_len, -1, torch.int32)
++        # RL_Pinchbench: flex mask distinct.
++        _rlpb_seen = set()
++
++        def _rlpb_distinct(tensor):
++            if id(tensor) in _rlpb_seen:
++                tensor = tensor.clone()
++            _rlpb_seen.add(id(tensor))
++            return tensor
++
++        packed_seq_ids_q = _rlpb_distinct(packed_seq_ids_q)
++        packed_seq_ids_kv = _rlpb_distinct(packed_seq_ids_kv)
++        padding_mask_q = _rlpb_distinct(padding_mask_q)
++        padding_mask_kv = _rlpb_distinct(padding_mask_kv)
++        vision_group_ids_q = _rlpb_distinct(vision_group_ids_q)
++        vision_group_ids_kv = _rlpb_distinct(vision_group_ids_kv)
++
++        def cp_mask(batch_idx, head_idx, q_idx, kv_idx):
++            allowed = _base_gemma4_cp_mask(attention_module, ctx, q_idx, kv_idx, kv_start_t)
++            if use_vision_bidirectional:
++                q_group = vision_group_ids_q[batch_idx, q_idx]
++                kv_group = vision_group_ids_kv[batch_idx, kv_idx]
++                same_vision_group = (q_group == kv_group) & (q_group >= 0)
++                allowed = allowed | same_vision_group
++            q_pack_id = packed_seq_ids_q[batch_idx, q_idx]
++            kv_pack_id = packed_seq_ids_kv[batch_idx, kv_idx]
++            allowed = allowed & (q_pack_id == kv_pack_id) & (q_pack_id > 0)
++            allowed = torch.where(q_pack_id <= 0, kv_idx == 0, allowed)
++            allowed = allowed & ~padding_mask_kv[batch_idx, kv_idx]
++            allowed = torch.where(padding_mask_q[batch_idx, q_idx], kv_idx == 0, allowed)
++            return allowed
++
++        block_mask_batch = query.shape[0]
+ 
+         def _build_block_mask():
+             return create_block_mask(
+diff --git a/nemo_automodel/components/models/gemma4_moe/model.py b/nemo_automodel/components/models/gemma4_moe/model.py
+index cb77b5a..e980f70 100644
+--- a/nemo_automodel/components/models/gemma4_moe/model.py
++++ b/nemo_automodel/components/models/gemma4_moe/model.py
+@@ -884,6 +884,57 @@ class Gemma4MoEModel(HFGemma4Model):
+         return self.language_model.norm
+ 
+ 
++def _rlpb_logprob_chunk(lm_head, hidden_chunk, target_chunk, softcap, temperature):
++    """One lm_head chunk. Matmul dtype matches compute_lm_head_logits; log_softmax stays fp32."""
++    # Tied lm_head is not FSDP-wrapped, so the fp32 hidden is not cast for us.
++    compute_dtype = None
++    get_state = getattr(lm_head, "_get_fsdp_state", None)
++    if get_state is not None:
++        compute_dtype = get_state()._mp_policy.param_dtype
++    weight = getattr(lm_head, "weight", None)
++    if compute_dtype is None and isinstance(weight, torch.Tensor):
++        compute_dtype = weight.dtype
++    if compute_dtype is not None and hidden_chunk.dtype != compute_dtype:
++        hidden_chunk = hidden_chunk.to(compute_dtype)
++    logits = lm_head(hidden_chunk)
++    if softcap is not None:
++        logits = torch.tanh(logits / softcap) * softcap
++    if temperature is not None and float(temperature) != 1.0:
++        logits = logits / float(temperature)
++    logits = logits.float()
++    log_probs = torch.log_softmax(logits, dim=-1)
++    index = target_chunk.to(device=log_probs.device, dtype=torch.long).unsqueeze(-1)
++    return log_probs.gather(dim=-1, index=index).squeeze(-1)
++
++
++def _rlpb_chunked_logprobs(lm_head, hidden, targets, softcap, chunk_size, temperature):
++    # RL_Pinchbench: chunked lm_head. Never materialize [B, S, vocab] fp32 logits.
++    if hidden.dim() != 3:
++        raise RuntimeError(f"RL_Pinchbench lm_head chunk expected [B, S, H], got {tuple(hidden.shape)}")
++    if hidden.shape[1] != targets.shape[1]:
++        raise RuntimeError(
++            f"RL_Pinchbench lm_head chunk length hidden={hidden.shape[1]} targets={targets.shape[1]}"
++        )
++    # 1024 token * 262144 * 4 B = 1 GiB. Backward also holds the grad of that chunk.
++    step = max(1, min(int(chunk_size or 1024), 1024))
++    pieces = []
++    for start in range(0, hidden.shape[1], step):
++        end = min(hidden.shape[1], start + step)
++        hidden_chunk = hidden[:, start:end, :]
++        target_chunk = targets[:, start:end]
++        if torch.is_grad_enabled() and hidden_chunk.requires_grad:
++            def _run(h, t, _lm=lm_head, _cap=softcap, _temp=temperature):
++                return _rlpb_logprob_chunk(_lm, h, t, _cap, _temp)
++            pieces.append(
++                torch.utils.checkpoint.checkpoint(_run, hidden_chunk, target_chunk, use_reentrant=False)
++            )
++        else:
++            pieces.append(
++                _rlpb_logprob_chunk(lm_head, hidden_chunk, target_chunk, softcap, temperature)
++            )
++    return torch.cat(pieces, dim=1) if len(pieces) > 1 else pieces[0]
++
++
+ # ---------------------------------------------------------------------------
+ # Top-level conditional-generation model
+ # ---------------------------------------------------------------------------
+@@ -1200,6 +1251,11 @@ class Gemma4ForConditionalGeneration(HFCheckpointingMixin, HFGemma4ForConditiona
+                 seq_len = inputs_embeds.shape[1]
+                 cache_position = torch.arange(seq_len, device=inputs_embeds.device)
+ 
++        # RL_Pinchbench: chunked lm_head kwargs must not reach language_model.
++        rlpb_local_targets = kwargs.pop("rlpb_local_targets", None)
++        rlpb_chunk_size = kwargs.pop("rlpb_chunk_size", None)
++        rlpb_temperature = kwargs.pop("rlpb_temperature", 1.0)
++
+         text_config = self.config.text_config if hasattr(self.config, "text_config") else self.config
+         cp_enabled = getattr(self, "_cp_enabled", False)
+         tp_e_series_enabled = bool(
+@@ -1405,6 +1461,22 @@ class Gemma4ForConditionalGeneration(HFCheckpointingMixin, HFGemma4ForConditiona
+ 
+         hidden_states = outputs.last_hidden_state
+ 
++        if rlpb_local_targets is not None:
++            softcap = getattr(text_config, "final_logit_softcapping", None)
++            logprobs = _rlpb_chunked_logprobs(
++                self.lm_head,
++                hidden_states,
++                rlpb_local_targets,
++                softcap,
++                rlpb_chunk_size,
++                rlpb_temperature,
++            )
++            logprobs.rlpb_local_logprobs = True
++            return CausalLMOutputWithPast(
++                logits=logprobs,
++                hidden_states=hidden_states if output_hidden_states else None,
++            )
++
+         logits = compute_lm_head_logits(
+             self.lm_head,
+             hidden_states,

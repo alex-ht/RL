@@ -31,8 +31,9 @@ fi
   --build-arg BUILD_MAX_JOBS="$build_max_jobs" \
   --build-arg BUILD_RAY_CPUS="$build_ray_cpus" \
   ${PINCHBENCH_SKILL_COMMIT:+--build-arg PINCHBENCH_SKILL_COMMIT="$PINCHBENCH_SKILL_COMMIT"} \
+  -f "$here/Dockerfile" \
   -t "$image:pinchbench-grpo-$short" -t "$image:pinchbench-grpo-latest" \
-  "$here"
+  "$repo"
 if [[ "${1:-}" == "--push" ]]; then
   docker push "$image:pinchbench-grpo-$short"
   docker push "$image:pinchbench-grpo-latest"

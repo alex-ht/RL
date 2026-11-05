@@ -1420,6 +1420,58 @@ class AutomodelPolicyWorkerImpl(
             )
 
 
+    # ── RL_Pinchbench: split train API（SingleController 用）────────────────
+    def begin_train_step(self, loss_fn, gbs=None, mbs=None) -> None:
+        if getattr(self, "_rlpb_step", None) is not None:
+            raise RuntimeError(
+                "a train step is already open; call finish_train_step or abort_train_step before begin"
+            )
+        self._rlpb_step = {"loss_fn": loss_fn, "mbs": mbs, "chunks": []}
+
+    def train_microbatch(self, data) -> None:
+        st = getattr(self, "_rlpb_step", None)
+        if st is None:
+            raise RuntimeError("no train step open; begin_train_step must be called first")
+        st["chunks"].append(data)
+
+    def finish_train_step(self) -> dict[str, Any]:
+        st = getattr(self, "_rlpb_step", None)
+        if st is None:
+            raise RuntimeError("no train step open; begin_train_step must be called first")
+        try:
+            chunks = st["chunks"]
+            if not chunks:
+                raise RuntimeError("finish_train_step called with no microbatches")
+            if len(chunks) == 1:
+                data = chunks[0]
+            else:
+                # 多個 chunk：合併後重新算 dynamic batching 的 micro_batch_indices
+                data = BatchedDataDict.from_batches(
+                    [c.to("cpu") for c in chunks],
+                    pad_value_dict={"input_ids": self.tokenizer.pad_token_id or 0},
+                )
+                data = self._apply_packing_prep(data)
+            local = torch.tensor([int(data.size)], device="cuda")
+            sizes = [torch.zeros_like(local) for _ in range(self.dp_size)]
+            torch.distributed.all_gather(sizes, local, group=self.dp_mesh.get_group())
+            sizes = [int(x.item()) for x in sizes]
+            if len(set(sizes)) != 1:
+                raise RuntimeError(f"uneven DP shard sizes in split train step: {sizes}")
+            return self.train(
+                data,
+                loss_fn=st["loss_fn"],
+                eval_mode=False,
+                gbs=sum(sizes),
+                mbs=st["mbs"],
+            )
+        finally:
+            self._rlpb_step = None
+
+    def abort_train_step(self) -> None:
+        self._rlpb_step = None
+        if getattr(self, "optimizer", None) is not None:
+            self.optimizer.zero_grad()
+
 @ray.remote(
     runtime_env=get_runtime_env_for_policy_worker("automodel_policy_worker")
 )  # pragma: no cover

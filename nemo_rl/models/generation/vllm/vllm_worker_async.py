@@ -1191,6 +1191,11 @@ class VllmAsyncGenerationWorkerImpl(
                     model_prefix_token_ids=model_prefix_token_ids,
                     template_prefix_token_ids=actual_corresponding_token_ids,
                     template_token_ids=engine_prompt["prompt_token_ids"],
+                    eos_token_id=(
+                        [int(x) for x in __import__("os").environ["NRL_SPLICE_EOS_TOKEN_IDS"].split(",")]
+                        if __import__("os").environ.get("NRL_SPLICE_EOS_TOKEN_IDS")
+                        else None
+                    ),  # NRL_SPLICE_EOS_TOKEN_IDS (RL_Pinchbench patch)
                 )
                 final_prompt_token_ids = splice.token_ids
                 media = await asyncio.to_thread(
